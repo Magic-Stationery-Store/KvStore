@@ -1,5 +1,9 @@
 # 把项目上传到 GitHub（手把手）
 
+> 当前状态：本地仓库已初始化，并完成首次提交 `d941f11`（53 个文件）。
+> 你只需要在 GitHub 建空仓库，然后执行第 4–5 步的 `git remote add` + `git push`。
+> 如果想从头再来一遍，按第 3 步重新初始化即可。
+
 > 前提：项目根目录是 `E:\VsCode\Cmake\kvstore`，Git 已安装（`git --version` 能输出版本）。
 
 ## 1. 先确认哪些东西不能提交
@@ -20,6 +24,11 @@
 git config --global user.name "你的名字"
 git config --global user.email "你的邮箱"
 ```
+
+> 提交记录里的邮箱是公开的。建议使用 GitHub 提供的
+> `12345678+username@users.noreply.github.com`，避免暴露 QQ/学校邮箱：
+> GitHub → Settings → Emails → Keep my email addresses private，页面会给出专用地址。
+> 修改后对**之后的提交**生效；已有提交可用 `git commit --amend --reset-author` 修正。
 
 ## 3. 初始化仓库并提交
 
