@@ -1,0 +1,154 @@
+# KVStore：从零实现的 LSM-Tree 单机存储引擎
+
+一个 C++17 编写的嵌入式持久化键值存储，实现了 WAL、有序 MemTable、不可变
+MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compact。
+配套一个 Qt Widgets 可视化控制台，用来观察各层数据、MANIFEST 和单 key 的查询路径。
+
+![Qt 控制台截图](docs/screenshot.png)
+
+## 核心特性
+
+- **写入路径**：`Put/Delete` 追加 WAL → 更新有序 MemTable → 达到阈值后冻结。
+- **崩溃恢复**：WAL 重放、截断尾部修复、CRC 校验；Active/Immutable 双 WAL 轮换
+  保证冻结快照在发布为 SSTable 之前始终可恢复。
+- **后台 Flush**：单后台线程把冻结快照写成 SSTable，提交 MANIFEST 后再回收
+  Immutable WAL；前台通过条件变量等待发布完成（Flush 屏障）。
+- **版本提交**：MANIFEST 是完整文本快照，带 CRC32；`tmp → fsync → rename →
+  目录 fsync` 一次原子替换即切换版本。
+- **全量 Compact**：合并 BASE、所有 L0 和 Active 数据，生成新 BASE 并一次性
+  退役全部 L0；旧文件残留不会让删除的 key 复活。
+- **并发安全**：单互斥锁保护全部状态，后台线程只处理冻结快照；进程锁防止
+  同一个数据库被多个进程打开。
+- **可观测性**：`inspect_entries` / `explain_key` / `inspect_tables` 只读接口，
+  Qt 控制台直接展示层次数据和查询路径（含被遮蔽的旧值）。
+- **跨平台**：核心逻辑 POSIX/Windows 双实现（`src/platform.cpp`），
+  Windows 上用 `CreateFile/FlushFileBuffers/MoveFileEx` 替代 `fsync/rename/flock`。
+
+## 架构
+
+```text
+写：Put/Delete
+      → 追加 WAL 记录（不 fsync）
+      → 更新 Active MemTable（std::map，有序，nullopt 为墓碑）
+      → 不同 key 数 ≥ 阈值（默认 64）
+      → 冻结：fsync WAL → 改名 .imm → 新建 Active WAL → 快照 swap
+      → 后台线程：写 L0 SSTable → 提交 MANIFEST → 删除 .imm
+
+读：Active MemTable
+      → Immutable MemTable
+      → L0 从新到旧
+      → BASE 内存索引 + 磁盘读值
+
+Compact：冻结并等待后台 → 合并 BASE + 全部 L0 + Active
+      → 写新 BASE（tmp → fsync → rename）
+      → 一次 MANIFEST 提交（BASE/RETIRED 前进、L0 清空）
+      → 回收旧文件、重置 WAL
+```
+
+## 磁盘文件
+
+| 文件 | 内容 |
+| --- | --- |
+| `kvstore.log.wal` | Active MemTable 的 WAL |
+| `kvstore.log.wal.L0.<20位编号>.imm` | 已冻结、尚未发布的 WAL |
+| `kvstore.log.L0.<20位编号>.sst` | 不可变有序表，有效性由 MANIFEST 决定 |
+| `kvstore.log.manifest` | 完整版本快照（文本 + CRC32） |
+| `kvstore.log.base.<20位编号>.log` | Compact 生成的基础数据 |
+| `kvstore.log` | 旧格式基础文件（仅 `BASE 0` 时使用） |
+| `kvstore.log.lock` | 进程锁 |
+
+记录格式：8 字节文件头（`KVDB` + 版本号），随后每条记录为
+`u8 op | u32 key_len | u32 value_len | key | value | u32 crc32`。
+
+## 构建与测试（Linux / WSL）
+
+```bash
+cmake -S . -B build-ubuntu -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-ubuntu -j2
+ctest --test-dir build-ubuntu --output-on-failure
+```
+
+当前 13 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+并发与进程锁、MANIFEST 的六类中断点恢复，以及可视化控制台使用的只读观测接口。
+
+```bash
+# 单测示例
+ctest --test-dir build-ubuntu -R '^kvstore_manifest_tests$' -V
+
+# 命令行体验
+./build-ubuntu/kvstore_cli
+```
+
+CLI 支持 `Put / Get / Delete / Sync / Flush / Compact / Exit`。
+
+Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
+实现替代）：
+
+```powershell
+cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_CXX_COMPILER=<MinGW>/bin/g++.exe
+cmake --build build-win
+```
+
+## Qt 可视化控制台
+
+`qt-demo/` 是一个 Qt Widgets 程序，链接 `libkvstore.a`，全部引擎调用都在 worker
+线程执行，界面通过队列信号刷新。功能：
+
+- 层次数据表：Active / Immutable / L0（新→旧）/ BASE，墓碑标红；
+- 查询路径：逐层展示命中/墓碑/未命中，并给出最终结果；
+- 文件列表：WAL、`.imm`、`.sst`、`.base.*.log`、MANIFEST 及大小；
+- MANIFEST 原文、操作日志、Sync / Flush / Compact 按钮。
+
+构建（Windows + MSYS2 Qt6，或 Linux 安装 `qt6-base-dev`）：
+
+```powershell
+# Windows：Qt 装在项目内的 .toolchains/msys64 时，直接运行脚本
+.\scripts\build-qt-demo.ps1
+.\scripts\run-qt-demo.ps1 -Demo
+```
+
+```bash
+# Linux / WSL
+cmake -S . -B build-qt -G Ninja -DKVSTORE_BUILD_QT_DEMO=ON \
+  -DCMAKE_PREFIX_PATH=<Qt6 安装路径>
+cmake --build build-qt
+./build-qt/qt-demo/kvstore_qt_demo --demo
+```
+
+`--demo` 会生成一个包含 BASE + L0 + Active 三层的演示库；在查询框输入 `b`
+可以看到 L0 的墓碑遮蔽 BASE 中的旧值。`--screenshot <path>` 可无头导出截图。
+详见 [qt-demo/README.md](qt-demo/README.md)。
+
+## 设计取舍
+
+| 决策 | 原因 | 代价 |
+| --- | --- | --- |
+| 每 key 全量内存索引 | 实现简单，查询 O(log N) | 大库内存占用高，尚无块索引/Bloom |
+| 全量文本 MANIFEST | 一次替换提交整个版本，易校验 | 每次 Flush 重写整份清单 |
+| 单后台线程 + 单 Immutable 槽位 | 天然背压，状态简单 | 前台写入可能被阻塞 |
+| Compact 持锁 | 实现简单、版本一致 | 压缩期间阻塞读写 |
+| 记录级 CRC | 能定位损坏记录 | SSTable 整体无校验和 |
+
+## 目录结构
+
+```text
+kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平台层）
+app/main.cpp            命令行程序
+qt-demo/                Qt Widgets 可视化控制台
+tests/                  13 个端到端测试
+learning/               学习期练习代码
+docs/                   截图与文档
+```
+
+## Roadmap
+
+- [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
+- [ ] SSTable 块索引 + Bloom Filter
+- [ ] 迭代器 / 范围扫描
+- [ ] WAL 组提交、无锁读路径
+- [ ] 基准测试与故障注入（kill -9、EIO）
+
+## License
+
+MIT

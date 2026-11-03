@@ -1,0 +1,44 @@
+# Build outputs
+/build*/
+build/
+cmake-build-*/
+out/
+
+# Local toolchains and Qt SDK installed inside the project (large binaries)
+/.toolchains/
+/.qt/
+
+# Database and test artifacts
+*.log
+*.log.wal
+*.log.manifest
+*.log.lock
+*.log.compact.tmp
+*.manifest.tmp
+*.sst
+*.sst.tmp
+*.imm
+*.base.*.log
+demo-data/
+qt-demo-data/
+
+# Editors
+.vscode/
+.idea/
+.cph/
+*.user
+*.swp
+
+# Local scratch files and historical backups
+/CMakeLists.original.txt
+/demo.txt
+*.pre-*.cpp
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.pdb

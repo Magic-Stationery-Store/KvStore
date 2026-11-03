@@ -1,0 +1,12 @@
+* text=auto
+*.cpp text
+*.h text
+*.md text
+*.txt text
+*.cmake text
+CMakeLists.txt text
+*.png binary
+*.jpg binary
+*.ico binary
+*.sst binary
+*.imm binary
