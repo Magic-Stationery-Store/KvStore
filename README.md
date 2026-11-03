@@ -1,6 +1,7 @@
 # KVStore：从零实现的 LSM-Tree 单机存储引擎
 
-[![CI](https://github.com/Magic-Stationery-Store/KvStore/actions/workflows/ci.yml/badge.svg)](https://github.com/Magic-Stationery-Store/KvStore/actions/workflows/ci.yml)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Qt](https://img.shields.io/badge/Qt-6.8%2B-green)
 
 一个 C++17 编写的嵌入式持久化键值存储，实现了 WAL、有序 MemTable、不可变
 MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compact。
