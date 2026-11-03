@@ -3,6 +3,7 @@
 build/
 cmake-build-*/
 out/
+/dist/
 
 # Local toolchains and Qt SDK installed inside the project (large binaries)
 /.toolchains/

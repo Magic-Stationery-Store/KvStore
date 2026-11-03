@@ -74,3 +74,22 @@ cmake --build build-qt
 ```
 
 使用 Qt 的 offscreen 平台插件渲染，适合在 CI 或没有显示器的环境生成 README 图片。
+
+## 打包成可分发目录
+
+`build-win/qt-demo/dist/` 已经包含 exe、Qt DLL、平台插件和 MinGW 运行库，复制到
+没装 Qt 的 Windows 机器也能直接运行。重新打包：
+
+```powershell
+$msys = ".toolchains\msys64\mingw64"
+$dist = "build-win\qt-demo\dist"
+cmake --build build-win
+New-Item -ItemType Directory -Force $dist
+Copy-Item build-win\qt-demo\kvstore_qt_demo.exe $dist
+& "$msys\bin\windeployqt.exe" --release --no-translations --compiler-runtime "$dist\kvstore_qt_demo.exe"
+Copy-Item "$msys\share\qt6\plugins\platforms\qoffscreen.dll" "$dist\platforms\"
+```
+
+注意：`windeployqt` 不会复制 MSYS2 的 MinGW 运行库（`libstdc++-6.dll`、
+`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`）以及 ICU/FreeType 等依赖，需要从
+`$msys\bin` 手动补齐；`dist` 只用于本地演示，不要提交到 Git。
