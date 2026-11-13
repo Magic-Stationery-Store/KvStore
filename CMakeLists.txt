@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     KVStore
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "A persistent key-value storage engine"
     LANGUAGES CXX
 )
@@ -45,6 +45,14 @@ add_executable(kvstore_cli
 target_link_libraries(kvstore_cli PRIVATE kvstore)
 set_target_properties(kvstore_cli PROPERTIES CXX_EXTENSIONS OFF)
 enable_project_warnings(kvstore_cli)
+
+add_executable(kvstore_bench
+    bench/benchmark.cpp
+)
+
+target_link_libraries(kvstore_bench PRIVATE kvstore)
+set_target_properties(kvstore_bench PROPERTIES CXX_EXTENSIONS OFF)
+enable_project_warnings(kvstore_bench)
 
 include(CTest)
 

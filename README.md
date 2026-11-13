@@ -93,6 +93,61 @@ cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release `
 cmake --build build-win
 ```
 
+## 性能基准
+
+`bench/benchmark.cpp` 提供单线程基准，覆盖 Put/Get、value 大小、Flush/Compact 和 L0 读放大。
+
+```bash
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build-bench -j2 --target kvstore_bench
+./build-bench/kvstore_bench
+```
+
+默认使用 `std::filesystem::temp_directory_path()`；Linux 下建议用 `TMPDIR` 指向真实文件系统，
+避免 tmpfs 让 `fsync` 变成空操作：
+
+```bash
+mkdir -p /home/you/kvstore-bench
+TMPDIR=/home/you/kvstore-bench ./build-bench/kvstore_bench
+```
+
+本机实测（WSL2 / Ubuntu 26.04 / ext4 / i9-13980HX / 单线程，value 100 B，5 万 key）：
+
+| 指标 | 数值 |
+| --- | --- |
+| Put 吞吐（不含 fsync） | 32.8 万 ops/s |
+| 一次 sync | 8.9 ms |
+| Get（MemTable） | 199 万 ops/s，P50 0.3 us / P99 0.9 us |
+| Get（L0） | 37.3 万 ops/s，P50 2.1 us / P99 9.4 us |
+| Flush | 130.7 ms |
+| Compact | 141.7 ms |
+| Get（BASE） | 36.7 万 ops/s，P50 2.2 us / P99 6.8 us |
+
+value 大小对吞吐的影响：
+
+| value | 记录数 | Put ops/s | Get ops/s | Get P99 |
+| --- | --- | --- | --- | --- |
+| 64 B | 20000 | 35.7 万 | 234 万 | 0.9 us |
+| 1 KiB | 20000 | 11.9 万 | 157 万 | 1.2 us |
+| 4 KiB | 10000 | 3.66 万 | 128 万 | 1.7 us |
+
+L0 读放大（`missing` 需要扫完所有 L0；`victim` 命中最早的表）：
+
+| L0 表数 | missing P50 | victim P50 |
+| --- | --- | --- |
+| 1 | 0.07 us | 1.42 us |
+| 10 | 0.30 us | 1.67 us |
+| 25 | 1.18 us | 5.26 us |
+| 50 | 1.50 us | 2.98 us |
+
+说明：
+
+- Put 只写 WAL 到页缓存，不含 `fsync`；`sync` 是 5 万条写后的一次 fsync。
+- 5 万个 key 都是唯一的，没有旧版本可回收，所以 Compact 前后大小不变；覆盖/删除场景由
+  `kvstore_compaction_tests` 覆盖。
+- L0 的 `victim` 延迟在 25→50 时回落，是页缓存/调度噪声；趋势看 `missing` 更稳定。
+- 数字是本机实测，换机器会变；它的作用是给后续优化一个基线。
+
 ## Qt 可视化控制台
 
 `qt-demo/` 是一个 Qt Widgets 程序，链接 `libkvstore.a`，全部引擎调用都在 worker
@@ -138,6 +193,7 @@ cmake --build build-qt
 ```text
 kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平台层）
 app/main.cpp            命令行程序
+bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
 tests/                  13 个端到端测试
 learning/               学习期练习代码
@@ -146,11 +202,12 @@ docs/                   截图与文档
 
 ## Roadmap
 
+- [x] 单线程性能基准（Put/Get、value 大小、L0 读放大、Compact）
+- [ ] kill -9 / EIO 故障注入
 - [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
 - [ ] SSTable 块索引 + Bloom Filter
 - [ ] 迭代器 / 范围扫描
 - [ ] WAL 组提交、无锁读路径
-- [ ] 基准测试与故障注入（kill -9、EIO）
 
 ## License
 
