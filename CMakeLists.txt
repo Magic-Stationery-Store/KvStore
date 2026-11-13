@@ -38,6 +38,22 @@ endfunction()
 
 enable_project_warnings(kvstore)
 
+set(KVSTORE_SANITIZER "" CACHE STRING
+    "Build with sanitizers: address,undefined or thread")
+if(KVSTORE_SANITIZER)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kvstore PUBLIC
+            -fsanitize=${KVSTORE_SANITIZER}
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kvstore PUBLIC
+            -fsanitize=${KVSTORE_SANITIZER}
+        )
+    else()
+        message(WARNING "KVSTORE_SANITIZER is only supported for GCC/Clang")
+    endif()
+endif()
+
 add_executable(kvstore_cli
     app/main.cpp
 )
@@ -204,8 +220,18 @@ if(BUILD_TESTING AND UNIX)
     enable_project_warnings(kvstore_inspect_tests)
     add_test(NAME kvstore_inspect_tests COMMAND kvstore_inspect_tests)
 
+    add_executable(kvstore_crash_recovery_tests tests/crash_recovery_test.cpp)
+    target_link_libraries(kvstore_crash_recovery_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_crash_recovery_tests)
+    add_test(
+        NAME kvstore_crash_recovery_tests
+        COMMAND kvstore_crash_recovery_tests
+    )
+
     set_tests_properties(kvstore_background_flush_tests kvstore_manifest_tests
         PROPERTIES TIMEOUT 60)
+    set_tests_properties(kvstore_crash_recovery_tests
+        PROPERTIES TIMEOUT 120)
 endif()
 
 if(BUILD_TESTING AND NOT UNIX)

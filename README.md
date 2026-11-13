@@ -71,8 +71,9 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 13 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
-并发与进程锁、MANIFEST 的六类中断点恢复，以及可视化控制台使用的只读观测接口。
+当前 14 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复，以及可视化控制台
+使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -83,6 +84,23 @@ ctest --test-dir build-ubuntu -R '^kvstore_manifest_tests$' -V
 ```
 
 CLI 支持 `Put / Get / Delete / Sync / Flush / Compact / Exit`。
+
+其中 `kvstore_crash_recovery_tests` 会 fork 子进程顺序写入、随机延迟后 `SIGKILL`，
+重开校验“已写入的 key 必须构成前缀”。默认 100 次，可用
+`KVSTORE_CRASH_ITERATIONS` 调整；本机实测 200 次全部通过（存活 key 150–1851，
+无空洞、无错值）。
+
+Sanitizer 构建：
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DKVSTORE_SANITIZER=address,undefined
+cmake --build build-asan -j2
+ctest --test-dir build-asan --output-on-failure
+```
+
+实测 ASan/UBSan 下 14/14 通过；`-DKVSTORE_SANITIZER=thread` 构建下 13 项通过
+（不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
 实现替代）：
@@ -195,7 +213,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  13 个端到端测试
+tests/                  14 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -203,7 +221,9 @@ docs/                   截图与文档
 ## Roadmap
 
 - [x] 单线程性能基准（Put/Get、value 大小、L0 读放大、Compact）
-- [ ] kill -9 / EIO 故障注入
+- [x] SIGKILL 崩溃恢复循环（200 次）
+- [x] ASan/UBSan/TSan 验证
+- [ ] 磁盘满 / EIO 故障注入
 - [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
 - [ ] SSTable 块索引 + Bloom Filter
 - [ ] 迭代器 / 范围扫描
