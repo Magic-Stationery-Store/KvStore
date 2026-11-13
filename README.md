@@ -24,10 +24,28 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   同一个数据库被多个进程打开。
 - **可观测性**：`inspect_entries` / `explain_key` / `inspect_tables` 只读接口，
   Qt 控制台直接展示层次数据和查询路径（含被遮蔽的旧值）。
+- **MVCC 快照读**：内部键为 `user_key + 反序 sequence(8B) + type(1B)`；
+  `snapshot()` / `get(key, snapshot)` / `new_iterator(snapshot)` 可读取历史版本，
+  墓碑在快照中同样可见。Compact 在没有活跃快照时回收旧版本，有快照时保守保留。
+- **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
+  sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
 - **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
-  提供 `Seek/Next` 并跳过墓碑；当前是快照物化实现，下一步替换为流式迭代器 + MVCC。
+  提供 `Seek/Next` 并跳过墓碑；当前是快照物化实现，下一步替换为流式迭代器。
 - **跨平台**：核心逻辑 POSIX/Windows 双实现（`src/platform.cpp`），
   Windows 上用 `CreateFile/FlushFileBuffers/MoveFileEx` 替代 `fsync/rename/flock`。
+
+### MVCC / WriteBatch 用法
+
+```cpp
+auto snapshot = store.snapshot();
+store.get("key", snapshot);          // read at a stable sequence
+auto iterator = store.new_iterator(snapshot);
+
+KVStore::WriteBatch batch;
+batch.put("a", "1");
+batch.erase("b");
+store.write(batch);                  // one WAL record, all-or-nothing
+```
 
 ## 架构
 
@@ -73,9 +91,9 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 15 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
-并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、快照迭代器，以及
-可视化控制台使用的只读观测接口。
+当前 17 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
+WriteBatch 原子提交，以及可视化控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -101,7 +119,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 15/15 通过；`-DKVSTORE_SANITIZER=thread` 构建下 14 项通过
+实测 ASan/UBSan 下 17/17 通过；`-DKVSTORE_SANITIZER=thread` 构建下 16 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -215,7 +233,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  15 个端到端测试
+tests/                  17 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -229,6 +247,9 @@ docs/                   截图与文档
 - [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
 - [ ] SSTable 块索引 + Bloom Filter
 - [x] 快照迭代器（Seek/Next，跳过墓碑）
+- [x] MVCC 快照读（get / iterator）
+- [x] WriteBatch 原子提交
+- [ ] 快照感知 GC（当前有活跃快照时保留全部版本）
 - [ ] 流式迭代器 / 范围扫描 API
 - [ ] WAL 组提交、无锁读路径
 

@@ -233,6 +233,16 @@ if(BUILD_TESTING AND UNIX)
     enable_project_warnings(kvstore_iterator_tests)
     add_test(NAME kvstore_iterator_tests COMMAND kvstore_iterator_tests)
 
+    add_executable(kvstore_mvcc_tests tests/mvcc_test.cpp)
+    target_link_libraries(kvstore_mvcc_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_mvcc_tests)
+    add_test(NAME kvstore_mvcc_tests COMMAND kvstore_mvcc_tests)
+
+    add_executable(kvstore_write_batch_tests tests/write_batch_test.cpp)
+    target_link_libraries(kvstore_write_batch_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_write_batch_tests)
+    add_test(NAME kvstore_write_batch_tests COMMAND kvstore_write_batch_tests)
+
     set_tests_properties(kvstore_background_flush_tests kvstore_manifest_tests
         PROPERTIES TIMEOUT 60)
     set_tests_properties(kvstore_crash_recovery_tests

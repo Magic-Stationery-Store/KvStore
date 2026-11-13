@@ -13,7 +13,7 @@ public:
     using std::runtime_error::runtime_error;
 };
 enum class Operation : std::uint8_t{
-    Put = 1, Delete = 2
+    Put = 1, Delete = 2, Batch = 3
 };
 
 struct LogRecord

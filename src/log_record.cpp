@@ -317,6 +317,10 @@ bool read_record(std::istream& input,
         operation_value
         == static_cast<std::uint8_t>(Operation::Delete)) {
         record.operation = Operation::Delete;
+    } else if (
+        operation_value
+        == static_cast<std::uint8_t>(Operation::Batch)) {
+        record.operation = Operation::Batch;
     } else {
         throw std::runtime_error(
             "Unknown operation in log file");

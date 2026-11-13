@@ -15,6 +15,13 @@ struct SSTableLookupResult {
     std::optional<std::string> value;
 };
 
+struct SSTableSeekResult {
+    // found=false: no key >= target exists in this table.
+    bool found = false;
+    std::string key;
+    std::optional<std::string> value;
+};
+
 class SSTable {
 public:
     using Entries =
@@ -29,6 +36,9 @@ public:
     explicit SSTable(std::string path);
 
     SSTableLookupResult get(const std::string& key) const;
+
+    // First entry with internal key >= target. Used by MVCC snapshot reads.
+    SSTableSeekResult seek(const std::string& key) const;
 
     Entries read_all() const;
 

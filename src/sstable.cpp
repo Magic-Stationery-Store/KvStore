@@ -214,6 +214,54 @@ SSTableLookupResult SSTable::get(
     return SSTableLookupResult{true, std::move(value)};
 }
 
+SSTableSeekResult SSTable::seek(
+    const std::string& key
+) const {
+    const auto it = std::lower_bound(
+        index_.begin(),
+        index_.end(),
+        key,
+        [](const IndexEntry& entry, const std::string& wanted) {
+            return entry.key < wanted;
+        }
+    );
+    if (it == index_.end()) {
+        return {};
+    }
+
+    SSTableSeekResult result;
+    result.found = true;
+    result.key = it->key;
+    if (it->tombstone) {
+        return result;
+    }
+
+    std::ifstream input(path_, std::ios::binary);
+    if (!input.is_open()) {
+        throw std::runtime_error("Cannot open SSTable for seek");
+    }
+    input.seekg(
+        static_cast<std::streamoff>(it->value_offset),
+        std::ios::beg
+    );
+    if (!input) {
+        throw std::runtime_error("Cannot seek to SSTable value");
+    }
+
+    std::string value(it->value_size, '\0');
+    if (it->value_size != 0) {
+        input.read(
+            value.data(),
+            static_cast<std::streamsize>(it->value_size)
+        );
+        if (!input) {
+            throw std::runtime_error("Cannot read SSTable value");
+        }
+    }
+    result.value = std::move(value);
+    return result;
+}
+
 SSTable::Entries SSTable::read_all() const {
     Entries entries;
     std::ifstream input(path_, std::ios::binary);

@@ -16,6 +16,7 @@
 
 #include "sstable.h"
 #include "manifest.h"
+#include "src/log_record.h"
 
 class KVStore{
     public:
@@ -86,11 +87,11 @@ class KVStore{
 
     std::string manifest_file_path() const;
 
-    // ---- Snapshot iterator (v0.4 step 1) ------------------------------
-    // new_iterator() builds an immutable, key-sorted view that merges
-    // Active, Immutable, L0 (newest first) and BASE. It materializes a
-    // snapshot under the mutex; later versions can replace this with a
-    // streaming merged iterator plus MVCC sequence numbers.
+    // ---- MVCC snapshot / iterator -------------------------------------
+    // Records are stored under an internal key:
+    //   user_key + inverted_sequence(8B, big-endian) + type(1B)
+    // For one user key versions sort newest first.  Snapshot reads pick the
+    // first version with sequence <= the snapshot sequence.
     using Entry = std::pair<std::string, std::string>;
 
     class Iterator {
@@ -114,17 +115,85 @@ class KVStore{
         std::size_t position_ = 0;
     };
 
+    class Snapshot {
+    public:
+        std::uint64_t sequence() const noexcept;
+
+    private:
+        friend class KVStore;
+
+        struct State;
+        explicit Snapshot(std::shared_ptr<const State> state);
+
+        std::shared_ptr<const State> state_;
+    };
+
+    Snapshot snapshot() const;
+
     Iterator new_iterator() const;
+    Iterator new_iterator(const Snapshot& snapshot) const;
+
+    std::optional<std::string> get(
+        const std::string& key,
+        const Snapshot& snapshot) const;
+
+    static std::string make_internal_key(
+        const std::string& key,
+        std::uint64_t sequence,
+        bool tombstone = false);
+
+    class WriteBatch {
+    public:
+        void put(const std::string& key, const std::string& value);
+        void erase(const std::string& key);
+        std::size_t size() const noexcept;
+
+    private:
+        friend class KVStore;
+
+        struct Item {
+            Operation operation = Operation::Put;
+            std::string key;
+            std::string value;
+        };
+
+        std::vector<Item> items_;
+    };
+
+    void write(const WriteBatch& batch);
 
     private:
     class ProcessLock;
+    struct SnapshotRegistry;
 
     struct IndexEntry {
         std::uint64_t value_offset;
         std::uint32_t value_size;
+        bool tombstone = false;
     };
 
-    std::shared_ptr<const std::vector<Entry>> snapshot_locked() const;
+    struct LookupResult {
+        bool found = false;
+        std::optional<std::string> value;
+    };
+
+    LookupResult lookup_locked(
+        const std::string& key,
+        std::uint64_t sequence
+    ) const;
+
+    void observe_internal_key(const std::string& internal_key);
+
+    void apply_log_record(const LogRecord& record);
+
+    std::uint64_t oldest_snapshot_locked() const;
+
+    std::shared_ptr<const std::vector<Entry>> snapshot_locked(
+        std::uint64_t sequence
+    ) const;
+
+    std::uint64_t last_sequence_ = 0;
+    std::shared_ptr<SnapshotRegistry> snapshot_registry_;
 
     void replay();
 
@@ -169,7 +238,7 @@ class KVStore{
     std::unordered_map<std::string, std::string>
         memory_data_;
 
-    std::unordered_map<std::string, IndexEntry>
+    std::map<std::string, IndexEntry>
         index_;
 
     // Only writes since the last compaction live here. nullopt is a tombstone.

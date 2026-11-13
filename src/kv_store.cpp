@@ -6,6 +6,7 @@
 #include<fstream>
 #include <iomanip>
 #include <queue>
+#include <set>
 #include <sstream>
 #include<stdexcept>
 #include <filesystem>
@@ -13,6 +14,154 @@
 #include <system_error>
 
 namespace {
+
+constexpr std::size_t kInternalSuffixSize = 9;
+
+std::string encode_internal_key(
+    const std::string& user_key,
+    std::uint64_t sequence,
+    bool tombstone
+) {
+    std::string internal;
+    internal.reserve(user_key.size() + kInternalSuffixSize);
+    internal.append(user_key);
+
+    const std::uint64_t inverted = ~sequence;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        internal.push_back(static_cast<char>(
+            (inverted >> shift) & 0xFFu));
+    }
+    internal.push_back(tombstone ? '\1' : '\0');
+    return internal;
+}
+
+bool decode_internal_key(
+    const std::string& internal,
+    std::string& user_key,
+    std::uint64_t& sequence,
+    bool& tombstone
+) {
+    if (internal.size() < kInternalSuffixSize) {
+        return false;
+    }
+    const std::size_t offset = internal.size() - kInternalSuffixSize;
+    std::uint64_t inverted = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        inverted = (inverted << 8)
+            | static_cast<unsigned char>(internal[offset + i]);
+    }
+    user_key = internal.substr(0, offset);
+    sequence = ~inverted;
+    tombstone = internal.back() != '\0';
+    return true;
+}
+
+std::string encode_seek_key(
+    const std::string& user_key,
+    std::uint64_t sequence
+) {
+    std::string seek;
+    seek.reserve(user_key.size() + kInternalSuffixSize);
+    seek.append(user_key);
+
+    const std::uint64_t inverted = ~sequence;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        seek.push_back(static_cast<char>(
+            (inverted >> shift) & 0xFFu));
+    }
+    seek.push_back('\0');
+    return seek;
+}
+
+void append_u32(std::string& output, std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        output.push_back(static_cast<char>(
+            (value >> shift) & 0xFFu));
+    }
+}
+
+std::uint32_t read_u32(
+    const std::string& input,
+    std::size_t& position
+) {
+    if (position + 4 > input.size()) {
+        throw std::runtime_error("Truncated batch record");
+    }
+    std::uint32_t value = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        value |= static_cast<std::uint32_t>(
+            static_cast<unsigned char>(input[position++])) << shift;
+    }
+    return value;
+}
+
+std::string encode_batch_payload(
+    const std::vector<std::pair<
+        Operation,
+        std::pair<std::string, std::string>>>& operations
+) {
+    std::string payload;
+    append_u32(payload, static_cast<std::uint32_t>(operations.size()));
+    for (const auto& [operation, entry] : operations) {
+        payload.push_back(static_cast<char>(operation));
+        append_u32(
+            payload, static_cast<std::uint32_t>(entry.first.size()));
+        append_u32(
+            payload, static_cast<std::uint32_t>(entry.second.size()));
+        payload.append(entry.first);
+        payload.append(entry.second);
+    }
+    return payload;
+}
+
+std::vector<std::pair<Operation, std::pair<std::string, std::string>>>
+decode_batch_payload(const std::string& payload) {
+    std::size_t position = 0;
+    const std::uint32_t count = read_u32(payload, position);
+    if (count > 1000000u) {
+        throw std::runtime_error("Batch record is too large");
+    }
+
+    std::vector<std::pair<
+        Operation,
+        std::pair<std::string, std::string>>> operations;
+    operations.reserve(count);
+
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (position >= payload.size()) {
+            throw std::runtime_error("Truncated batch record");
+        }
+        const auto operation = static_cast<Operation>(
+            static_cast<unsigned char>(payload[position++]));
+        if (operation != Operation::Put
+            && operation != Operation::Delete) {
+            throw std::runtime_error("Invalid operation in batch record");
+        }
+
+        const std::uint32_t key_size = read_u32(payload, position);
+        const std::uint32_t value_size = read_u32(payload, position);
+        if (position + key_size + value_size > payload.size()) {
+            throw std::runtime_error("Truncated batch record");
+        }
+        std::string key = payload.substr(position, key_size);
+        position += key_size;
+        std::string value = payload.substr(position, value_size);
+        position += value_size;
+
+        if (operation == Operation::Delete && !value.empty()) {
+            throw std::runtime_error("DELETE in batch contains a value");
+        }
+        operations.push_back({
+            operation,
+            {std::move(key), std::move(value)}
+        });
+    }
+
+    if (position != payload.size()) {
+        throw std::runtime_error("Trailing bytes in batch record");
+    }
+    return operations;
+}
 
 bool ensure_log_file(const std::string& path) {
     {
@@ -151,7 +300,49 @@ private:
     kvplatform::FileLock lock_;
 };
 
-KVStore::KVStore() = default;
+struct KVStore::SnapshotRegistry {
+    mutable std::mutex mutex;
+    std::multiset<std::uint64_t> active;
+
+    void add(std::uint64_t sequence) {
+        const std::lock_guard<std::mutex> guard(mutex);
+        active.insert(sequence);
+    }
+
+    void release(std::uint64_t sequence) {
+        const std::lock_guard<std::mutex> guard(mutex);
+        const auto it = active.find(sequence);
+        if (it != active.end()) {
+            active.erase(it);
+        }
+    }
+
+    std::uint64_t oldest_or(std::uint64_t fallback) const {
+        const std::lock_guard<std::mutex> guard(mutex);
+        return active.empty() ? fallback : *active.begin();
+    }
+
+    bool has_active() const {
+        const std::lock_guard<std::mutex> guard(mutex);
+        return !active.empty();
+    }
+};
+
+struct KVStore::Snapshot::State {
+    std::uint64_t sequence = 0;
+    std::weak_ptr<SnapshotRegistry> registry;
+
+    ~State() {
+        if (const auto locked = registry.lock()) {
+            locked->release(sequence);
+        }
+    }
+};
+
+KVStore::KVStore() {
+    snapshot_registry_ = std::make_shared<SnapshotRegistry>();
+}
+
 KVStore::~KVStore() {
     if (!background_thread_.joinable()) {
         return;
@@ -170,6 +361,7 @@ KVStore::KVStore(
 )
     : memtable_entry_limit_(memtable_entry_limit),
       log_path_(log_path) {
+    snapshot_registry_ = std::make_shared<SnapshotRegistry>();
     if (log_path_.empty()) {
         throw std::invalid_argument(
             "Log path cannot be empty");
@@ -195,8 +387,13 @@ void KVStore::put(const std::string& key,
     rethrow_background_error_locked();
     if (log_path_.empty()) {
         memory_data_[key] = value;
+        ++last_sequence_;
         return;
     }
+
+    const std::uint64_t sequence = ++last_sequence_;
+    const std::string internal =
+        encode_internal_key(key, sequence, false);
 
     std::ofstream output(
         wal_path_,
@@ -210,7 +407,7 @@ void KVStore::put(const std::string& key,
 
     write_record(
         output,
-        LogRecord{Operation::Put, key, value}
+        LogRecord{Operation::Put, internal, value}
     );
 
     output.close();
@@ -221,70 +418,258 @@ void KVStore::put(const std::string& key,
     }
 
     dirty_ = true;
-    memtable_[key] = value;
+    memtable_[internal] = value;
     if (memtable_.size() >= memtable_entry_limit_) {
         freeze_memtable_locked(lock);
     }
 }
+
 std::optional<std::string>
 KVStore::get(const std::string& key) const
 {
     const std::lock_guard<std::mutex> guard(mutex_);
     rethrow_background_error_locked();
-    return get_locked(key);
+    const LookupResult result =
+        lookup_locked(key, last_sequence_);
+    return result.value;
 }
 
 std::optional<std::string>
-KVStore::get_locked(const std::string& key) const {
+KVStore::get(
+    const std::string& key,
+    const Snapshot& snapshot
+) const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    rethrow_background_error_locked();
+    const LookupResult result =
+        lookup_locked(key, snapshot.sequence());
+    return result.value;
+}
+
+KVStore::LookupResult KVStore::lookup_locked(
+    const std::string& key,
+    std::uint64_t sequence
+) const {
     if (log_path_.empty()) {
         const auto it = memory_data_.find(key);
-
         if (it == memory_data_.end()) {
-            return std::nullopt;
+            return LookupResult{};
         }
-
-        return it->second;
+        return LookupResult{true, it->second};
     }
 
-    const auto pending = memtable_.find(key);
-    if (pending != memtable_.end()) {
-        return pending->second;
+    const std::string seek = encode_seek_key(key, sequence);
+
+    const auto matches = [&key](
+        const std::string& internal,
+        const std::optional<std::string>& value
+    ) -> std::optional<LookupResult> {
+        std::string decoded_key;
+        std::uint64_t decoded_sequence = 0;
+        bool tombstone = false;
+        if (!decode_internal_key(
+                internal, decoded_key, decoded_sequence, tombstone)) {
+            return std::nullopt;
+        }
+        if (decoded_key != key) {
+            return std::nullopt;
+        }
+        return LookupResult{true, value};
+    };
+
+    const auto active = memtable_.lower_bound(seek);
+    if (active != memtable_.end()) {
+        const auto result = matches(active->first, active->second);
+        if (result.has_value()) {
+            return *result;
+        }
     }
 
     if (immutable_memtable_) {
-        const auto immutable = immutable_memtable_->find(key);
+        const auto immutable = immutable_memtable_->lower_bound(seek);
         if (immutable != immutable_memtable_->end()) {
-            return immutable->second;
+            const auto result = matches(immutable->first, immutable->second);
+            if (result.has_value()) {
+                return *result;
+            }
         }
     }
 
     for (auto table = level0_tables_.rbegin();
          table != level0_tables_.rend();
          ++table) {
-        const SSTableLookupResult result =
-            table->table->get(key);
-        if (result.found) {
-            return result.value;
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            continue;
+        }
+        const auto match = matches(result.key, result.value);
+        if (match.has_value()) {
+            return *match;
         }
     }
 
-    const auto it = index_.find(key);
-
-    if (it == index_.end()) {
-        return std::nullopt;
+    const auto base = index_.lower_bound(seek);
+    if (base == index_.end()) {
+        return LookupResult{};
     }
 
-    std::ifstream input(
-        base_path_,
-        std::ios::binary
-    );
+    std::string decoded_key;
+    std::uint64_t decoded_sequence = 0;
+    bool tombstone = false;
+    if (!decode_internal_key(
+            base->first, decoded_key, decoded_sequence, tombstone)) {
+        return LookupResult{};
+    }
+    if (decoded_key != key) {
+        return LookupResult{};
+    }
+    if (base->second.tombstone) {
+        return LookupResult{true, std::nullopt};
+    }
 
+    std::ifstream input(base_path_, std::ios::binary);
     if (!input.is_open()) {
         throw std::runtime_error(
             "Cannot open log for reading value");
     }
+    return LookupResult{true, read_value(input, base->second)};
+}
 
-    return read_value(input, it->second);
+std::string KVStore::make_internal_key(
+    const std::string& key,
+    std::uint64_t sequence,
+    bool tombstone
+) {
+    return encode_internal_key(key, sequence, tombstone);
+}
+
+void KVStore::observe_internal_key(const std::string& internal_key) {
+    std::string key;
+    std::uint64_t sequence = 0;
+    bool tombstone = false;
+    if (decode_internal_key(
+            internal_key, key, sequence, tombstone)) {
+        last_sequence_ = std::max(last_sequence_, sequence);
+    }
+}
+
+void KVStore::apply_log_record(const LogRecord& record) {
+    if (record.operation == Operation::Batch) {
+        for (const auto& [operation, entry] :
+             decode_batch_payload(record.value)) {
+            observe_internal_key(entry.first);
+            if (operation == Operation::Put) {
+                memtable_[entry.first] = entry.second;
+            } else {
+                memtable_[entry.first] = std::nullopt;
+            }
+        }
+        return;
+    }
+
+    observe_internal_key(record.key);
+    if (record.operation == Operation::Put) {
+        memtable_[record.key] = record.value;
+    } else {
+        memtable_[record.key] = std::nullopt;
+    }
+}
+
+void KVStore::WriteBatch::put(
+    const std::string& key,
+    const std::string& value
+) {
+    items_.push_back(Item{Operation::Put, key, value});
+}
+
+void KVStore::WriteBatch::erase(const std::string& key) {
+    items_.push_back(Item{Operation::Delete, key, ""});
+}
+
+std::size_t KVStore::WriteBatch::size() const noexcept {
+    return items_.size();
+}
+
+void KVStore::write(const WriteBatch& batch) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    rethrow_background_error_locked();
+
+    if (batch.items_.empty()) {
+        return;
+    }
+
+    if (log_path_.empty()) {
+        for (const auto& item : batch.items_) {
+            if (item.operation == Operation::Put) {
+                memory_data_[item.key] = item.value;
+            } else {
+                memory_data_.erase(item.key);
+            }
+        }
+        ++last_sequence_;
+        return;
+    }
+
+    const std::uint64_t sequence = ++last_sequence_;
+
+    // A batch may touch the same key multiple times; only the last operation
+    // matters, and all operations share one commit sequence.
+    std::map<std::string, WriteBatch::Item> collapsed;
+    for (const auto& item : batch.items_) {
+        collapsed[item.key] = item;
+    }
+
+    std::vector<std::pair<
+        Operation,
+        std::pair<std::string, std::string>>> payload_operations;
+    std::vector<std::pair<std::string, std::optional<std::string>>>
+        memtable_operations;
+
+    for (const auto& [user_key, item] : collapsed) {
+        const bool tombstone = item.operation == Operation::Delete;
+        const std::string internal =
+            encode_internal_key(user_key, sequence, tombstone);
+        payload_operations.push_back({
+            item.operation,
+            {internal, tombstone ? std::string() : item.value}
+        });
+        memtable_operations.push_back({
+            internal,
+            tombstone
+                ? std::optional<std::string>{}
+                : std::optional<std::string>{item.value}
+        });
+    }
+
+    const std::string payload = encode_batch_payload(payload_operations);
+
+    std::ofstream output(
+        wal_path_,
+        std::ios::binary | std::ios::app
+    );
+    if (!output.is_open()) {
+        throw std::runtime_error(
+            "Cannot open log for writing batch");
+    }
+
+    write_record(
+        output,
+        LogRecord{Operation::Batch, "", payload}
+    );
+
+    output.close();
+    if (!output) {
+        throw std::runtime_error(
+            "Cannot close log after writing batch");
+    }
+
+    dirty_ = true;
+    for (const auto& [internal, value] : memtable_operations) {
+        memtable_[internal] = value;
+    }
+    if (memtable_.size() >= memtable_entry_limit_) {
+        freeze_memtable_locked(lock);
+    }
 }
 
 std::string KVStore::read_value(
@@ -331,11 +716,15 @@ bool KVStore::remove(const std::string& key) {
         return memory_data_.erase(key) > 0;
     }
 
-    const bool exists = get_locked(key).has_value();
-
-    if (!exists) {
+    const LookupResult current =
+        lookup_locked(key, last_sequence_);
+    if (!current.found || !current.value.has_value()) {
         return false;
     }
+
+    const std::uint64_t sequence = ++last_sequence_;
+    const std::string internal =
+        encode_internal_key(key, sequence, true);
 
     std::ofstream output(
         wal_path_,
@@ -349,7 +738,7 @@ bool KVStore::remove(const std::string& key) {
 
     write_record(
         output,
-        LogRecord{Operation::Delete, key, ""}
+        LogRecord{Operation::Delete, internal, ""}
     );
 
     output.close();
@@ -360,11 +749,16 @@ bool KVStore::remove(const std::string& key) {
     }
 
     dirty_ = true;
-    memtable_[key] = std::nullopt;
+    memtable_[internal] = std::nullopt;
     if (memtable_.size() >= memtable_entry_limit_) {
         freeze_memtable_locked(lock);
     }
     return true;
+}
+
+std::optional<std::string>
+KVStore::get_locked(const std::string& key) const {
+    return lookup_locked(key, last_sequence_).value;
 }
 
 void KVStore::sync() {
@@ -446,8 +840,13 @@ void KVStore::initialize_manifest() {
         replay();
         for (const auto generation : manifest_.level0) {
             const std::string path = sstable_path_for_generation(generation);
+            auto table = std::make_unique<SSTable>(path);
+            for (const auto& [key, value] : table->read_all()) {
+                (void)value;
+                observe_internal_key(key);
+            }
             level0_tables_.push_back(Level0Table{
-                generation, path, std::make_unique<SSTable>(path)
+                generation, path, std::move(table)
             });
         }
         return;
@@ -557,10 +956,15 @@ void KVStore::load_sstables() {
 
     std::sort(files.begin(), files.end());
     for (const auto& [generation, path] : files) {
+        auto table = std::make_unique<SSTable>(path);
+        for (const auto& [key, value] : table->read_all()) {
+            (void)value;
+            observe_internal_key(key);
+        }
         level0_tables_.push_back(Level0Table{
             generation,
             path,
-            std::make_unique<SSTable>(path)
+            std::move(table)
         });
         if (generation
             == std::numeric_limits<std::uint64_t>::max()) {
@@ -638,9 +1042,23 @@ void KVStore::recover_immutable_wals() {
             SSTable::Entries recovered;
             replay_file(
                 immutable_wal,
-                [&recovered](
+                [this, &recovered](
                     const LogRecord& record,
                     const RecordLocation&) {
+                    if (record.operation == Operation::Batch) {
+                        for (const auto& [operation, entry] :
+                             decode_batch_payload(record.value)) {
+                            observe_internal_key(entry.first);
+                            if (operation == Operation::Put) {
+                                recovered[entry.first] = entry.second;
+                            } else {
+                                recovered[entry.first] = std::nullopt;
+                            }
+                        }
+                        return;
+                    }
+
+                    observe_internal_key(record.key);
                     if (record.operation == Operation::Put) {
                         recovered[record.key] = record.value;
                     } else {
@@ -851,24 +1269,55 @@ void KVStore::compact() {
     if (!memtable_.empty()) { freeze_memtable_locked(lock); }
     wait_for_background_flush_locked(lock);
 
-    // Collect a consistent version while holding the mutex. A writer may have
-    // added active entries while our condition-variable wait released it.
+    // Collect every internal-key version while holding the mutex. A writer
+    // may have added active entries while our condition-variable wait
+    // released it.
     std::ifstream source(base_path_, std::ios::binary);
     if (!source) { throw std::runtime_error("Cannot open base for compaction"); }
-    std::map<std::string, std::string> live_values;
+
+    std::map<std::string, std::optional<std::string>> merged;
     for (const auto& [key, entry] : index_) {
-        live_values[key] = read_value(source, entry);
+        if (entry.tombstone) {
+            merged[key] = std::nullopt;
+        } else {
+            merged[key] = read_value(source, entry);
+        }
     }
     source.close();
     for (const auto& table : level0_tables_) {
         for (const auto& [key, value] : table.table->read_all()) {
-            if (value) { live_values[key] = *value; }
-            else { live_values.erase(key); }
+            merged[key] = value;
         }
     }
     for (const auto& [key, value] : memtable_) {
-        if (value) { live_values[key] = *value; }
-        else { live_values.erase(key); }
+        merged[key] = value;
+    }
+
+    // With no live snapshot we can drop every superseded version. With a live
+    // snapshot we conservatively keep all versions; snapshot-aware GC is the
+    // next refinement.
+    std::map<std::string, std::optional<std::string>> output_entries;
+    if (snapshot_registry_->has_active()) {
+        output_entries = merged;
+    } else {
+        bool has_user = false;
+        std::string last_user;
+        for (const auto& [key, value] : merged) {
+            std::string user;
+            std::uint64_t sequence = 0;
+            bool tombstone = false;
+            if (!decode_internal_key(
+                    key, user, sequence, tombstone)) {
+                continue;
+            }
+            if (!has_user || user != last_user) {
+                has_user = true;
+                last_user = user;
+                if (value.has_value()) {
+                    output_entries[key] = value;
+                }
+            }
+        }
     }
 
     if (next_sstable_generation_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -877,14 +1326,22 @@ void KVStore::compact() {
     const auto generation = next_sstable_generation_++;
     const std::string new_base = base_file_path(log_path_, generation);
     const std::string temporary = new_base + ".tmp";
-    std::unordered_map<std::string, IndexEntry> new_index;
-    new_index.reserve(live_values.size());
+    std::map<std::string, IndexEntry> new_index;
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) { throw std::runtime_error("Cannot create compacted base"); }
     write_log_header(output);
-    for (const auto& [key, value] : live_values) {
-        const auto location = write_record(output, LogRecord{Operation::Put, key, value});
-        new_index.emplace(key, IndexEntry{location.value_offset, location.value_size});
+    for (const auto& [key, value] : output_entries) {
+        if (value.has_value()) {
+            const auto location = write_record(
+                output, LogRecord{Operation::Put, key, *value});
+            new_index.emplace(key, IndexEntry{
+                location.value_offset, location.value_size, false});
+        } else {
+            const auto location = write_record(
+                output, LogRecord{Operation::Delete, key, ""});
+            new_index.emplace(key, IndexEntry{
+                location.value_offset, location.value_size, true});
+        }
     }
     output.close();
     if (!output) { throw std::runtime_error("Cannot finish compacted base"); }
@@ -983,13 +1440,20 @@ void KVStore::replay() {
             return;
         }
 
+        observe_internal_key(record.key);
+
         if (record.operation == Operation::Put) {
             index_[record.key] = IndexEntry{
                 location.value_offset,
-                location.value_size
+                location.value_size,
+                false
             };
         } else {
-            index_.erase(record.key);
+            index_[record.key] = IndexEntry{
+                location.value_offset,
+                location.value_size,
+                true
+            };
         }
     }
 }
@@ -998,11 +1462,7 @@ void KVStore::replay_wal() {
     const bool repaired = replay_file(
         wal_path_,
         [this](const LogRecord& record, const RecordLocation&) {
-            if (record.operation == Operation::Put) {
-                memtable_[record.key] = record.value;
-            } else {
-                memtable_[record.key] = std::nullopt;
-            }
+            apply_log_record(record);
         }
     );
     dirty_ = dirty_ || repaired;
@@ -1023,7 +1483,15 @@ KVStore::inspect_entries(std::size_t limit) const {
         if (rows.size() >= limit) {
             return false;
         }
-        rows.push_back(InspectRow{layer, key, value});
+        std::string display_key = key;
+        std::string decoded_key;
+        std::uint64_t decoded_sequence = 0;
+        bool tombstone = false;
+        if (decode_internal_key(
+                key, decoded_key, decoded_sequence, tombstone)) {
+            display_key = decoded_key;
+        }
+        rows.push_back(InspectRow{layer, display_key, value});
         return true;
     };
 
@@ -1082,7 +1550,12 @@ KVStore::inspect_entries(std::size_t limit) const {
         std::sort(keys.begin(), keys.end());
 
         for (const auto& key : keys) {
-            if (!push("BASE", key, read_value(input, index_.at(key)))) {
+            const IndexEntry& entry = index_.at(key);
+            if (entry.tombstone) {
+                if (!push("BASE", key, std::nullopt)) {
+                    return rows;
+                }
+            } else if (!push("BASE", key, read_value(input, entry))) {
                 return rows;
             }
         }
@@ -1114,19 +1587,36 @@ KVStore::explain_key(const std::string& key) const {
         return rows;
     }
 
-    const auto active = memtable_.find(key);
+    const std::string seek = encode_seek_key(key, last_sequence_);
+    const auto probe = [&key](
+        const std::string& internal,
+        const std::optional<std::string>& value) {
+        std::string decoded;
+        std::uint64_t sequence = 0;
+        bool tombstone = false;
+        if (!decode_internal_key(
+                internal, decoded, sequence, tombstone)
+            || decoded != key) {
+            return LookupResult{};
+        }
+        return LookupResult{true, value};
+    };
+
+    const auto active = memtable_.lower_bound(seek);
     if (active == memtable_.end()) {
         add("Active", false, std::nullopt);
     } else {
-        add("Active", true, active->second);
+        const auto result = probe(active->first, active->second);
+        add("Active", result.found, result.value);
     }
 
     if (immutable_memtable_) {
-        const auto immutable = immutable_memtable_->find(key);
+        const auto immutable = immutable_memtable_->lower_bound(seek);
         if (immutable == immutable_memtable_->end()) {
             add("Immutable", false, std::nullopt);
         } else {
-            add("Immutable", true, immutable->second);
+            const auto result = probe(immutable->first, immutable->second);
+            add("Immutable", result.found, result.value);
         }
     } else {
         add("Immutable", false, std::nullopt);
@@ -1135,24 +1625,39 @@ KVStore::explain_key(const std::string& key) const {
     for (auto table = level0_tables_.rbegin();
          table != level0_tables_.rend();
          ++table) {
-        const SSTableLookupResult result = table->table->get(key);
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            add(
+                "L0#" + std::to_string(table->generation),
+                false,
+                std::nullopt);
+            continue;
+        }
+        const auto match = probe(result.key, result.value);
         add(
             "L0#" + std::to_string(table->generation),
-            result.found,
-            result.value
+            match.found,
+            match.value
         );
     }
 
-    const auto base = index_.find(key);
+    const auto base = index_.lower_bound(seek);
     if (base == index_.end()) {
         add("BASE", false, std::nullopt);
     } else {
-        std::ifstream input(base_path_, std::ios::binary);
-        if (!input.is_open()) {
-            throw std::runtime_error(
-                "Cannot open base file for inspection");
+        const auto match = probe(base->first, std::nullopt);
+        if (!match.found) {
+            add("BASE", false, std::nullopt);
+        } else if (base->second.tombstone) {
+            add("BASE", true, std::nullopt);
+        } else {
+            std::ifstream input(base_path_, std::ios::binary);
+            if (!input.is_open()) {
+                throw std::runtime_error(
+                    "Cannot open base file for inspection");
+            }
+            add("BASE", true, read_value(input, base->second));
         }
-        add("BASE", true, read_value(input, base->second));
     }
 
     return rows;
@@ -1267,149 +1772,124 @@ void KVStore::Iterator::next() noexcept {
     }
 }
 
+KVStore::Snapshot::Snapshot(
+    std::shared_ptr<const State> state
+) : state_(std::move(state)) {}
+
+std::uint64_t KVStore::Snapshot::sequence() const noexcept {
+    return state_ ? state_->sequence : 0;
+}
+
+KVStore::Snapshot KVStore::snapshot() const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    rethrow_background_error_locked();
+
+    auto state = std::make_shared<Snapshot::State>();
+    state->sequence = last_sequence_;
+    state->registry = snapshot_registry_;
+    snapshot_registry_->add(last_sequence_);
+    return Snapshot(std::move(state));
+}
+
 KVStore::Iterator KVStore::new_iterator() const {
     const std::lock_guard<std::mutex> guard(mutex_);
     rethrow_background_error_locked();
-    return Iterator(snapshot_locked(), 0);
+    return Iterator(snapshot_locked(last_sequence_), 0);
+}
+
+KVStore::Iterator KVStore::new_iterator(
+    const Snapshot& snapshot
+) const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    rethrow_background_error_locked();
+    return Iterator(snapshot_locked(snapshot.sequence()), 0);
+}
+
+std::uint64_t KVStore::oldest_snapshot_locked() const {
+    if (!snapshot_registry_) {
+        return last_sequence_;
+    }
+    return snapshot_registry_->oldest_or(last_sequence_);
 }
 
 std::shared_ptr<const std::vector<KVStore::Entry>>
-KVStore::snapshot_locked() const {
-    struct Source {
-        std::vector<std::pair<std::string, std::optional<std::string>>> entries;
-        std::size_t position = 0;
-        int priority = 0;
-    };
-
-    std::vector<Source> sources;
-
-    const auto add_ordered = [&sources](
-        const std::map<std::string, std::optional<std::string>>& entries,
-        int priority
-    ) {
-        if (entries.empty()) {
-            return;
-        }
-        Source source;
-        source.priority = priority;
-        source.entries.reserve(entries.size());
-        for (const auto& [key, value] : entries) {
-            source.entries.emplace_back(key, value);
-        }
-        sources.push_back(std::move(source));
-    };
-
+KVStore::snapshot_locked(std::uint64_t sequence) const {
     if (log_path_.empty()) {
-        Source source;
-        source.priority = 0;
-        source.entries.reserve(memory_data_.size());
+        std::vector<Entry> result;
+        result.reserve(memory_data_.size());
         for (const auto& [key, value] : memory_data_) {
-            source.entries.emplace_back(key, value);
+            result.emplace_back(key, value);
         }
         std::sort(
-            source.entries.begin(),
-            source.entries.end(),
-            [](const auto& left, const auto& right) {
+            result.begin(),
+            result.end(),
+            [](const Entry& left, const Entry& right) {
                 return left.first < right.first;
             });
-        if (!source.entries.empty()) {
-            sources.push_back(std::move(source));
+        return std::make_shared<const std::vector<Entry>>(
+            std::move(result));
+    }
+
+    // user key -> (highest visible sequence, value/tombstone)
+    std::map<std::string, std::pair<std::uint64_t, std::optional<std::string>>>
+        chosen;
+
+    const auto consider = [&chosen, sequence](
+        const std::string& internal,
+        const std::optional<std::string>& value
+    ) {
+        std::string user;
+        std::uint64_t record_sequence = 0;
+        bool tombstone = false;
+        if (!decode_internal_key(
+                internal, user, record_sequence, tombstone)) {
+            return;
         }
-    } else {
-        add_ordered(memtable_, 0);
-
-        if (immutable_memtable_) {
-            add_ordered(*immutable_memtable_, 1);
+        if (record_sequence > sequence) {
+            return;
         }
-
-        int priority = 2;
-        for (auto table = level0_tables_.rbegin();
-             table != level0_tables_.rend();
-             ++table, ++priority) {
-            add_ordered(table->table->read_all(), priority);
+        const auto found = chosen.find(user);
+        if (found == chosen.end()
+            || record_sequence > found->second.first) {
+            chosen[user] = {record_sequence, value};
         }
+    };
 
-        if (!index_.empty()) {
-            std::vector<std::string> keys;
-            keys.reserve(index_.size());
-            for (const auto& [key, entry] : index_) {
-                (void)entry;
-                keys.push_back(key);
-            }
-            std::sort(keys.begin(), keys.end());
-
-            Source source;
-            source.priority = priority;
-            source.entries.reserve(keys.size());
-
-            std::ifstream input(base_path_, std::ios::binary);
-            if (!input.is_open()) {
-                throw std::runtime_error(
-                    "Cannot open base file for iterator");
-            }
-            for (const auto& key : keys) {
-                source.entries.emplace_back(
-                    key, read_value(input, index_.at(key)));
-            }
-            if (!source.entries.empty()) {
-                sources.push_back(std::move(source));
-            }
+    for (const auto& [key, value] : memtable_) {
+        consider(key, value);
+    }
+    if (immutable_memtable_) {
+        for (const auto& [key, value] : *immutable_memtable_) {
+            consider(key, value);
+        }
+    }
+    for (const auto& table : level0_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            consider(key, value);
         }
     }
 
-    struct HeapNode {
-        std::string key;
-        int priority;
-        std::size_t source;
-    };
-    struct Compare {
-        bool operator()(const HeapNode& left, const HeapNode& right) const {
-            if (left.key != right.key) {
-                return left.key > right.key;
-            }
-            return left.priority > right.priority;
+    if (!index_.empty()) {
+        std::ifstream input(base_path_, std::ios::binary);
+        if (!input.is_open()) {
+            throw std::runtime_error(
+                "Cannot open base file for iterator");
         }
-    };
-
-    std::priority_queue<HeapNode, std::vector<HeapNode>, Compare> heap;
-    for (std::size_t i = 0; i < sources.size(); ++i) {
-        if (!sources[i].entries.empty()) {
-            heap.push(HeapNode{
-                sources[i].entries.front().first,
-                sources[i].priority,
-                i
-            });
+        for (const auto& [key, entry] : index_) {
+            if (entry.tombstone) {
+                consider(key, std::nullopt);
+            } else {
+                consider(key, read_value(input, entry));
+            }
         }
     }
 
     std::vector<Entry> result;
-    bool has_last = false;
-    std::string last_key;
-
-    while (!heap.empty()) {
-        const HeapNode node = heap.top();
-        heap.pop();
-
-        Source& source = sources[node.source];
-        const auto& entry = source.entries[source.position];
-
-        if (!has_last || entry.first != last_key) {
-            has_last = true;
-            last_key = entry.first;
-            if (entry.second.has_value()) {
-                result.emplace_back(entry.first, *entry.second);
-            }
-        }
-
-        ++source.position;
-        if (source.position < source.entries.size()) {
-            heap.push(HeapNode{
-                source.entries[source.position].first,
-                source.priority,
-                node.source
-            });
+    result.reserve(chosen.size());
+    for (const auto& [user, record] : chosen) {
+        if (record.second.has_value()) {
+            result.emplace_back(user, *record.second);
         }
     }
-
     return std::make_shared<const std::vector<Entry>>(std::move(result));
 }

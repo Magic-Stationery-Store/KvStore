@@ -30,6 +30,14 @@ std::string imm_path(const std::string& db, std::uint64_t id) {
     return path.str();
 }
 
+std::string ikey(
+    const std::string& key,
+    std::uint64_t sequence,
+    bool tombstone = false
+) {
+    return KVStore::make_internal_key(key, sequence, tombstone);
+}
+
 void write_log(const std::string& path, const std::vector<LogRecord>& records) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     write_log_header(output);
@@ -51,8 +59,8 @@ int main() {
     std::filesystem::create_directory(directory);
     try {
         const std::string legacy = (directory / "legacy.log").string();
-        write_log(legacy, {{Operation::Put, "key", "legacy"}});
-        SSTable::build(table_path(legacy, 3), {{"key", "table"}});
+        write_log(legacy, {{Operation::Put, ikey("key", 1), "legacy"}});
+        SSTable::build(table_path(legacy, 3), {{ikey("key", 2), "table"}});
         {
             KVStore store(legacy);
             const auto state = read_manifest(legacy + ".manifest");
@@ -61,8 +69,8 @@ int main() {
         }
 
         // Disk output exists but was never committed to MANIFEST.
-        SSTable::build(table_path(legacy, 99), {{"key", "uncommitted"}});
-        write_log(base_file_path(legacy, 100), {{Operation::Put, "key", "wrong"}});
+        SSTable::build(table_path(legacy, 99), {{ikey("key", 99), "uncommitted"}});
+        write_log(base_file_path(legacy, 100), {{Operation::Put, ikey("key", 100), "wrong"}});
         auto unfinished = read_manifest(legacy + ".manifest");
         unfinished.level0 = {99};
         unfinished.next_generation = 101;
@@ -79,18 +87,19 @@ int main() {
         // not the uncommitted SSTable. Active WAL remains newer than both.
         const std::string recovery = (directory / "recovery.log").string();
         { KVStore store(recovery); }
-        write_log(imm_path(recovery, 1), {{Operation::Put, "key", "frozen"}});
-        SSTable::build(table_path(recovery, 1), {{"key", "bad-output"}});
-        write_log(recovery + ".wal", {{Operation::Put, "key", "active"}});
+        write_log(imm_path(recovery, 1), {{Operation::Put, ikey("key", 1), "frozen"}});
+        SSTable::build(table_path(recovery, 1), {{ikey("key", 1), "bad-output"}});
+        write_log(recovery + ".wal", {{Operation::Put, ikey("key", 2), "active"}});
         {
             KVStore store(recovery);
             SSTable recovered(table_path(recovery, 1));
-            check(recovered.get("key").value == "frozen" && store.get("key") == "active",
+            check(recovered.get(ikey("key", 1)).value == "frozen"
+                      && store.get("key") == "active",
                   "immutable WAL rebuilds uncommitted L0; newer active WAL wins");
         }
 
         // Crash after metadata commit but before deleting immutable WAL.
-        write_log(imm_path(recovery, 1), {{Operation::Put, "key", "stale-duplicate"}});
+        write_log(imm_path(recovery, 1), {{Operation::Put, ikey("key", 1), "stale-duplicate"}});
         {
             KVStore store(recovery);
             check(store.get("key") == "active" && !std::filesystem::exists(imm_path(recovery, 1)),
@@ -118,7 +127,7 @@ int main() {
                   "compaction commits a new base and retires all L0 in one snapshot");
         }
         std::filesystem::copy_file(saved, old_table);
-        write_log(imm_path(compact, old_id), {{Operation::Put, "deleted", "old"}});
+        write_log(imm_path(compact, old_id), {{Operation::Put, ikey("deleted", 1), "old"}});
         {
             KVStore store(compact);
             check(!store.get("deleted") && store.get("keep") == "new",
