@@ -26,7 +26,8 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   Qt 控制台直接展示层次数据和查询路径（含被遮蔽的旧值）。
 - **MVCC 快照读**：内部键为 `user_key + 反序 sequence(8B) + type(1B)`；
   `snapshot()` / `get(key, snapshot)` / `new_iterator(snapshot)` 可读取历史版本，
-  墓碑在快照中同样可见。Compact 在没有活跃快照时回收旧版本，有快照时保守保留。
+  墓碑在快照中同样可见。Compact 按最老活跃快照回收旧版本：保留快照可见的版本，
+  无快照时每个 key 只保留最新版本。
 - **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
   sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
 - **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
@@ -91,9 +92,9 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 17 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+当前 18 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
 并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
-WriteBatch 原子提交，以及可视化控制台使用的只读观测接口。
+WriteBatch 原子提交、快照感知 GC，以及可视化控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -119,7 +120,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 17/17 通过；`-DKVSTORE_SANITIZER=thread` 构建下 16 项通过
+实测 ASan/UBSan 下 18/18 通过；`-DKVSTORE_SANITIZER=thread` 构建下 17 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -234,7 +235,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  17 个端到端测试
+tests/                  18 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -250,7 +251,7 @@ docs/                   截图与文档
 - [x] 快照迭代器（Seek/Next，跳过墓碑）
 - [x] MVCC 快照读（get / iterator）
 - [x] WriteBatch 原子提交
-- [ ] 快照感知 GC（当前有活跃快照时保留全部版本）
+- [x] 快照感知 GC（按最老活跃快照回收旧版本）
 - [ ] 流式迭代器 / 范围扫描 API
 - [ ] WAL 组提交、无锁读路径
 

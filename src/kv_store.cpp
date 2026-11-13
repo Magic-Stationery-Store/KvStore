@@ -1293,32 +1293,78 @@ void KVStore::compact() {
         merged[key] = value;
     }
 
-    // With no live snapshot we can drop every superseded version. With a live
-    // snapshot we conservatively keep all versions; snapshot-aware GC is the
-    // next refinement.
+    // Keep every version at or above the oldest live snapshot, plus the
+    // newest version below it as the fallback for that snapshot. With no
+    // snapshots, only the latest version is needed.
+    const bool has_snapshots = snapshot_registry_->has_active();
+    const std::uint64_t oldest =
+        has_snapshots ? oldest_snapshot_locked() : 0;
+
+    struct Version {
+        std::string internal;
+        std::optional<std::string> value;
+        std::uint64_t sequence = 0;
+    };
+
     std::map<std::string, std::optional<std::string>> output_entries;
-    if (snapshot_registry_->has_active()) {
-        output_entries = merged;
-    } else {
-        bool has_user = false;
-        std::string last_user;
-        for (const auto& [key, value] : merged) {
-            std::string user;
-            std::uint64_t sequence = 0;
-            bool tombstone = false;
-            if (!decode_internal_key(
-                    key, user, sequence, tombstone)) {
-                continue;
+    std::vector<Version> group;
+    std::string group_user;
+
+    const auto flush_group = [&]() {
+        if (group.empty()) {
+            return;
+        }
+
+        if (!has_snapshots) {
+            if (group.front().value.has_value()) {
+                output_entries[group.front().internal] =
+                    group.front().value;
             }
-            if (!has_user || user != last_user) {
-                has_user = true;
-                last_user = user;
-                if (value.has_value()) {
-                    output_entries[key] = value;
+            group.clear();
+            return;
+        }
+
+        std::vector<std::size_t> keep;
+        bool exact_oldest = false;
+        for (std::size_t i = 0; i < group.size(); ++i) {
+            if (group[i].sequence >= oldest) {
+                keep.push_back(i);
+                if (group[i].sequence == oldest) {
+                    exact_oldest = true;
                 }
+            } else {
+                if (!exact_oldest) {
+                    keep.push_back(i);
+                }
+                break;
             }
         }
+
+        // A trailing tombstone has no older retained version to hide.
+        if (!keep.empty() && !group[keep.back()].value.has_value()) {
+            keep.pop_back();
+        }
+        for (const std::size_t index : keep) {
+            output_entries[group[index].internal] = group[index].value;
+        }
+        group.clear();
+    };
+
+    for (const auto& [internal, value] : merged) {
+        std::string user;
+        std::uint64_t sequence = 0;
+        bool tombstone = false;
+        if (!decode_internal_key(
+                internal, user, sequence, tombstone)) {
+            continue;
+        }
+        if (!group.empty() && user != group_user) {
+            flush_group();
+        }
+        group_user = user;
+        group.push_back(Version{internal, value, sequence});
     }
+    flush_group();
 
     if (next_sstable_generation_ == std::numeric_limits<std::uint64_t>::max()) {
         throw std::runtime_error("Base generation number is exhausted");
