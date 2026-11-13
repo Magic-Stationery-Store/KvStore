@@ -153,38 +153,39 @@ TMPDIR=/home/you/kvstore-bench ./build-bench/kvstore_bench
 
 | 指标 | 数值 |
 | --- | --- |
-| Put 吞吐（不含 fsync） | 32.8 万 ops/s |
-| 一次 sync | 8.9 ms |
-| Get（MemTable） | 199 万 ops/s，P50 0.3 us / P99 0.9 us |
-| Get（L0） | 37.3 万 ops/s，P50 2.1 us / P99 9.4 us |
-| Flush | 130.7 ms |
-| Compact | 141.7 ms |
-| Get（BASE） | 36.7 万 ops/s，P50 2.2 us / P99 6.8 us |
+| Put 吞吐（不含 fsync） | 33.1 万 ops/s |
+| 一次 sync | 12.1 ms |
+| Get（MemTable） | 200 万 ops/s，P50 0.3 us / P99 0.8 us |
+| Get（L0） | 39.8 万 ops/s，P50 2.1 us / P99 5.7 us |
+| Flush | 122.1 ms |
+| Compact | 159.2 ms |
+| Get（BASE） | 38.5 万 ops/s，P50 2.2 us / P99 3.8 us |
 
 value 大小对吞吐的影响：
 
 | value | 记录数 | Put ops/s | Get ops/s | Get P99 |
 | --- | --- | --- | --- | --- |
-| 64 B | 20000 | 35.7 万 | 234 万 | 0.9 us |
-| 1 KiB | 20000 | 11.9 万 | 157 万 | 1.2 us |
-| 4 KiB | 10000 | 3.66 万 | 128 万 | 1.7 us |
+| 64 B | 20000 | 34.7 万 | 230 万 | 0.7 us |
+| 1 KiB | 20000 | 12.8 万 | 164 万 | 1.1 us |
+| 4 KiB | 10000 | 4.2 万 | 127 万 | 1.4 us |
 
 L0 读放大（`missing` 需要扫完所有 L0；`victim` 命中最早的表）：
 
 | L0 表数 | missing P50 | victim P50 |
 | --- | --- | --- |
-| 1 | 0.07 us | 1.42 us |
-| 10 | 0.30 us | 1.67 us |
-| 25 | 1.18 us | 5.26 us |
-| 50 | 1.50 us | 2.98 us |
+| 1 | 1.45 us | 1.47 us |
+| 10 | 1.72 us | 1.63 us |
+| 25 | 2.29 us | 2.42 us |
+| 50 | 12.68 us | 3.40 us |
 
 说明：
 
 - Put 只写 WAL 到页缓存，不含 `fsync`；`sync` 是 5 万条写后的一次 fsync。
-- 5 万个 key 都是唯一的，没有旧版本可回收，所以 Compact 前后大小不变；覆盖/删除场景由
-  `kvstore_compaction_tests` 覆盖。
-- L0 的 `victim` 延迟在 25→50 时回落，是页缓存/调度噪声；趋势看 `missing` 更稳定。
-- 数字是本机实测，换机器会变；它的作用是给后续优化一个基线。
+- 每个 key 额外带 9 B 的 MVCC 内部后缀，所以 BASE 约 6640 KiB；5 万个 key 都是唯一的，
+  没有旧版本可回收，因此 Compact 前后大小不变；覆盖/删除场景由 `kvstore_compaction_tests` 覆盖。
+- L0 表数到 50 时 `missing` P50 从 1.45 us 升到 12.68 us，体现读放大；`victim` 命中
+  最早的表，稳定在 1.5–3.4 us。
+- Put/Get 已包含内部键编码和快照版本选择；数字是本机实测，换机器会变。
 
 ## Qt 可视化控制台
 
