@@ -24,6 +24,8 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   同一个数据库被多个进程打开。
 - **可观测性**：`inspect_entries` / `explain_key` / `inspect_tables` 只读接口，
   Qt 控制台直接展示层次数据和查询路径（含被遮蔽的旧值）。
+- **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
+  提供 `Seek/Next` 并跳过墓碑；当前是快照物化实现，下一步替换为流式迭代器 + MVCC。
 - **跨平台**：核心逻辑 POSIX/Windows 双实现（`src/platform.cpp`），
   Windows 上用 `CreateFile/FlushFileBuffers/MoveFileEx` 替代 `fsync/rename/flock`。
 
@@ -71,9 +73,9 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 14 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
-并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复，以及可视化控制台
-使用的只读观测接口。
+当前 15 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、快照迭代器，以及
+可视化控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -99,7 +101,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 14/14 通过；`-DKVSTORE_SANITIZER=thread` 构建下 13 项通过
+实测 ASan/UBSan 下 15/15 通过；`-DKVSTORE_SANITIZER=thread` 构建下 14 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -213,7 +215,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  14 个端到端测试
+tests/                  15 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -226,7 +228,8 @@ docs/                   截图与文档
 - [ ] 磁盘满 / EIO 故障注入
 - [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
 - [ ] SSTable 块索引 + Bloom Filter
-- [ ] 迭代器 / 范围扫描
+- [x] 快照迭代器（Seek/Next，跳过墓碑）
+- [ ] 流式迭代器 / 范围扫描 API
 - [ ] WAL 组提交、无锁读路径
 
 ## License

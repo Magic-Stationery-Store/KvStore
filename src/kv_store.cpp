@@ -5,6 +5,7 @@
 #include <cerrno>
 #include<fstream>
 #include <iomanip>
+#include <queue>
 #include <sstream>
 #include<stdexcept>
 #include <filesystem>
@@ -1216,4 +1217,199 @@ std::string KVStore::wal_file_path() const {
 std::string KVStore::manifest_file_path() const {
     const std::lock_guard<std::mutex> guard(mutex_);
     return manifest_path_;
+}
+
+KVStore::Iterator::Iterator(
+    std::shared_ptr<const std::vector<Entry>> data,
+    std::size_t position
+) : data_(std::move(data)), position_(position) {}
+
+bool KVStore::Iterator::valid() const noexcept {
+    return data_ != nullptr && position_ < data_->size();
+}
+
+const std::string& KVStore::Iterator::key() const {
+    if (!valid()) {
+        throw std::out_of_range("Iterator::key on invalid iterator");
+    }
+    return (*data_)[position_].first;
+}
+
+const std::string& KVStore::Iterator::value() const {
+    if (!valid()) {
+        throw std::out_of_range("Iterator::value on invalid iterator");
+    }
+    return (*data_)[position_].second;
+}
+
+void KVStore::Iterator::seek(const std::string& target) {
+    if (data_ == nullptr) {
+        position_ = 0;
+        return;
+    }
+    const auto it = std::lower_bound(
+        data_->begin(),
+        data_->end(),
+        target,
+        [](const Entry& entry, const std::string& wanted) {
+            return entry.first < wanted;
+        });
+    position_ = static_cast<std::size_t>(it - data_->begin());
+}
+
+void KVStore::Iterator::seek_to_first() noexcept {
+    position_ = 0;
+}
+
+void KVStore::Iterator::next() noexcept {
+    if (valid()) {
+        ++position_;
+    }
+}
+
+KVStore::Iterator KVStore::new_iterator() const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    rethrow_background_error_locked();
+    return Iterator(snapshot_locked(), 0);
+}
+
+std::shared_ptr<const std::vector<KVStore::Entry>>
+KVStore::snapshot_locked() const {
+    struct Source {
+        std::vector<std::pair<std::string, std::optional<std::string>>> entries;
+        std::size_t position = 0;
+        int priority = 0;
+    };
+
+    std::vector<Source> sources;
+
+    const auto add_ordered = [&sources](
+        const std::map<std::string, std::optional<std::string>>& entries,
+        int priority
+    ) {
+        if (entries.empty()) {
+            return;
+        }
+        Source source;
+        source.priority = priority;
+        source.entries.reserve(entries.size());
+        for (const auto& [key, value] : entries) {
+            source.entries.emplace_back(key, value);
+        }
+        sources.push_back(std::move(source));
+    };
+
+    if (log_path_.empty()) {
+        Source source;
+        source.priority = 0;
+        source.entries.reserve(memory_data_.size());
+        for (const auto& [key, value] : memory_data_) {
+            source.entries.emplace_back(key, value);
+        }
+        std::sort(
+            source.entries.begin(),
+            source.entries.end(),
+            [](const auto& left, const auto& right) {
+                return left.first < right.first;
+            });
+        if (!source.entries.empty()) {
+            sources.push_back(std::move(source));
+        }
+    } else {
+        add_ordered(memtable_, 0);
+
+        if (immutable_memtable_) {
+            add_ordered(*immutable_memtable_, 1);
+        }
+
+        int priority = 2;
+        for (auto table = level0_tables_.rbegin();
+             table != level0_tables_.rend();
+             ++table, ++priority) {
+            add_ordered(table->table->read_all(), priority);
+        }
+
+        if (!index_.empty()) {
+            std::vector<std::string> keys;
+            keys.reserve(index_.size());
+            for (const auto& [key, entry] : index_) {
+                (void)entry;
+                keys.push_back(key);
+            }
+            std::sort(keys.begin(), keys.end());
+
+            Source source;
+            source.priority = priority;
+            source.entries.reserve(keys.size());
+
+            std::ifstream input(base_path_, std::ios::binary);
+            if (!input.is_open()) {
+                throw std::runtime_error(
+                    "Cannot open base file for iterator");
+            }
+            for (const auto& key : keys) {
+                source.entries.emplace_back(
+                    key, read_value(input, index_.at(key)));
+            }
+            if (!source.entries.empty()) {
+                sources.push_back(std::move(source));
+            }
+        }
+    }
+
+    struct HeapNode {
+        std::string key;
+        int priority;
+        std::size_t source;
+    };
+    struct Compare {
+        bool operator()(const HeapNode& left, const HeapNode& right) const {
+            if (left.key != right.key) {
+                return left.key > right.key;
+            }
+            return left.priority > right.priority;
+        }
+    };
+
+    std::priority_queue<HeapNode, std::vector<HeapNode>, Compare> heap;
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        if (!sources[i].entries.empty()) {
+            heap.push(HeapNode{
+                sources[i].entries.front().first,
+                sources[i].priority,
+                i
+            });
+        }
+    }
+
+    std::vector<Entry> result;
+    bool has_last = false;
+    std::string last_key;
+
+    while (!heap.empty()) {
+        const HeapNode node = heap.top();
+        heap.pop();
+
+        Source& source = sources[node.source];
+        const auto& entry = source.entries[source.position];
+
+        if (!has_last || entry.first != last_key) {
+            has_last = true;
+            last_key = entry.first;
+            if (entry.second.has_value()) {
+                result.emplace_back(entry.first, *entry.second);
+            }
+        }
+
+        ++source.position;
+        if (source.position < source.entries.size()) {
+            heap.push(HeapNode{
+                source.entries[source.position].first,
+                source.priority,
+                node.source
+            });
+        }
+    }
+
+    return std::make_shared<const std::vector<Entry>>(std::move(result));
 }

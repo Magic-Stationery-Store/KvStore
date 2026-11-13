@@ -11,6 +11,7 @@
 #include<string>
 #include<thread>
 #include<unordered_map>
+#include<utility>
 #include<vector>
 
 #include "sstable.h"
@@ -85,6 +86,36 @@ class KVStore{
 
     std::string manifest_file_path() const;
 
+    // ---- Snapshot iterator (v0.4 step 1) ------------------------------
+    // new_iterator() builds an immutable, key-sorted view that merges
+    // Active, Immutable, L0 (newest first) and BASE. It materializes a
+    // snapshot under the mutex; later versions can replace this with a
+    // streaming merged iterator plus MVCC sequence numbers.
+    using Entry = std::pair<std::string, std::string>;
+
+    class Iterator {
+    public:
+        bool valid() const noexcept;
+        const std::string& key() const;
+        const std::string& value() const;
+        void seek(const std::string& target);
+        void seek_to_first() noexcept;
+        void next() noexcept;
+
+    private:
+        friend class KVStore;
+
+        Iterator(
+            std::shared_ptr<const std::vector<Entry>> data,
+            std::size_t position
+        );
+
+        std::shared_ptr<const std::vector<Entry>> data_;
+        std::size_t position_ = 0;
+    };
+
+    Iterator new_iterator() const;
+
     private:
     class ProcessLock;
 
@@ -92,6 +123,8 @@ class KVStore{
         std::uint64_t value_offset;
         std::uint32_t value_size;
     };
+
+    std::shared_ptr<const std::vector<Entry>> snapshot_locked() const;
 
     void replay();
 

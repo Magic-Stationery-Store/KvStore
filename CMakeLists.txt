@@ -228,6 +228,11 @@ if(BUILD_TESTING AND UNIX)
         COMMAND kvstore_crash_recovery_tests
     )
 
+    add_executable(kvstore_iterator_tests tests/iterator_test.cpp)
+    target_link_libraries(kvstore_iterator_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_iterator_tests)
+    add_test(NAME kvstore_iterator_tests COMMAND kvstore_iterator_tests)
+
     set_tests_properties(kvstore_background_flush_tests kvstore_manifest_tests
         PROPERTIES TIMEOUT 60)
     set_tests_properties(kvstore_crash_recovery_tests
