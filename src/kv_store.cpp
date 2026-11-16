@@ -6,6 +6,7 @@
 #include <cerrno>
 #include<fstream>
 #include <iomanip>
+#include <iterator>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -229,6 +230,32 @@ void replace_with_empty_log(
         std::filesystem::remove(temporary_path, cleanup_error);
         throw;
     }
+}
+
+std::vector<SSTable::Entries> split_entries(
+    const SSTable::Entries& entries,
+    std::size_t target_bytes
+) {
+    std::vector<SSTable::Entries> chunks;
+    SSTable::Entries chunk;
+    std::size_t chunk_bytes = 0;
+
+    for (const auto& [key, value] : entries) {
+        chunk[key] = value;
+        chunk_bytes += key.size() + 32;
+        if (value.has_value()) {
+            chunk_bytes += value->size();
+        }
+        if (chunk_bytes >= target_bytes) {
+            chunks.push_back(std::move(chunk));
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+    }
+    if (!chunk.empty()) {
+        chunks.push_back(std::move(chunk));
+    }
+    return chunks;
 }
 
 } // namespace
@@ -461,6 +488,22 @@ KVStore::LookupResult KVStore::lookup_locked(
 
     for (auto table = level1_tables_.rbegin();
          table != level1_tables_.rend();
+         ++table) {
+        if (!table->table->might_contain_user(key)) {
+            continue;
+        }
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            continue;
+        }
+        const auto match = matches(result.key, result.value);
+        if (match.has_value()) {
+            return *match;
+        }
+    }
+
+    for (auto table = level2_tables_.rbegin();
+         table != level2_tables_.rend();
          ++table) {
         if (!table->table->might_contain_user(key)) {
             continue;
@@ -787,6 +830,22 @@ std::string KVStore::level1_path_for_generation(
     return (base.parent_path() / filename.str()).string();
 }
 
+std::string KVStore::level2_path_for_generation(
+    std::uint64_t generation
+) const {
+    const std::filesystem::path base =
+        std::filesystem::absolute(log_path_).lexically_normal();
+    std::ostringstream filename;
+    filename
+        << base.filename().string()
+        << ".L2."
+        << std::setw(20)
+        << std::setfill('0')
+        << generation
+        << ".sst";
+    return (base.parent_path() / filename.str()).string();
+}
+
 std::string KVStore::immutable_wal_path_for_generation(
     std::uint64_t generation
 ) const {
@@ -848,6 +907,18 @@ void KVStore::initialize_manifest() {
                 generation, path, std::move(table)
             });
         }
+        for (const auto generation : manifest_.level2) {
+            const std::string path =
+                level2_path_for_generation(generation);
+            auto table = std::make_shared<SSTable>(path, block_cache_);
+            for (const auto& [key, value] : table->read_all()) {
+                (void)value;
+                observe_internal_key(key);
+            }
+            level2_tables_.push_back(Level0Table{
+                generation, path, std::move(table)
+            });
+        }
         return;
     }
 
@@ -892,17 +963,21 @@ void KVStore::cleanup_obsolete_files() {
         const std::string filename = item.path().filename().string();
         const auto table = parse_id(filename, name + ".L0.", ".sst");
         const auto level1 = parse_id(filename, name + ".L1.", ".sst");
+        const auto level2 = parse_id(filename, name + ".L2.", ".sst");
         const auto base = parse_id(filename, name + ".base.", ".log");
         const bool obsolete_table = table && !std::binary_search(
             manifest_.level0.begin(), manifest_.level0.end(), *table);
         const bool obsolete_level1 = level1 && !std::binary_search(
             manifest_.level1.begin(), manifest_.level1.end(), *level1);
+        const bool obsolete_level2 = level2 && !std::binary_search(
+            manifest_.level2.begin(), manifest_.level2.end(), *level2);
         const bool obsolete_base = base && *base != manifest_.base_generation;
         const bool temporary = parse_id(filename, name + ".L0.", ".sst.tmp")
             || parse_id(filename, name + ".L1.", ".sst.tmp")
+            || parse_id(filename, name + ".L2.", ".sst.tmp")
             || parse_id(filename, name + ".base.", ".log.tmp")
             || filename == name + ".manifest.tmp";
-        if (obsolete_table || obsolete_level1
+        if (obsolete_table || obsolete_level1 || obsolete_level2
             || obsolete_base || temporary) {
             std::filesystem::remove(item.path());
             removed = true;
@@ -1298,6 +1373,11 @@ void KVStore::compact() {
             merged[key] = value;
         }
     }
+    for (const auto& table : level2_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            merged[key] = value;
+        }
+    }
     for (const auto& [key, value] : memtable_) {
         merged[key] = value;
     }
@@ -1421,6 +1501,7 @@ void KVStore::compact() {
     index_ = std::move(new_index);
     level0_tables_.clear();
     level1_tables_.clear();
+    level2_tables_.clear();
     replace_with_empty_log(wal_path_, ".compact.tmp");
     memtable_.clear();
     dirty_ = false;
@@ -1443,6 +1524,16 @@ std::size_t KVStore::level0_compaction_trigger() const {
     return level0_compaction_trigger_;
 }
 
+void KVStore::set_level1_to_level2_trigger_bytes(std::size_t bytes) {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    level1_to_level2_trigger_bytes_ = bytes;
+}
+
+std::size_t KVStore::level1_to_level2_trigger_bytes() const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    return level1_to_level2_trigger_bytes_;
+}
+
 void KVStore::compact_levels_locked(
     std::unique_lock<std::mutex>& lock
 ) {
@@ -1457,9 +1548,40 @@ void KVStore::compact_levels_locked(
         return;
     }
 
-    std::map<std::string, std::optional<std::string>> merged;
+    std::string l0_min;
+    std::string l0_max;
+    bool has_l0_range = false;
+    for (const auto& table : level0_tables_) {
+        const auto range = table.table->user_key_range();
+        if (!has_l0_range) {
+            l0_min = range.first;
+            l0_max = range.second;
+            has_l0_range = true;
+        } else {
+            l0_min = std::min(l0_min, range.first);
+            l0_max = std::max(l0_max, range.second);
+        }
+    }
+    if (!has_l0_range) {
+        return;
+    }
+
+    std::vector<Level0Table> kept_l1;
+    std::vector<const Level0Table*> selected_l1;
     for (const auto& table : level1_tables_) {
-        for (const auto& [key, value] : table.table->read_all()) {
+        const auto range = table.table->user_key_range();
+        const bool overlaps =
+            !(range.second < l0_min || range.first > l0_max);
+        if (overlaps) {
+            selected_l1.push_back(&table);
+        } else {
+            kept_l1.push_back(table);
+        }
+    }
+
+    std::map<std::string, std::optional<std::string>> merged;
+    for (const auto* table : selected_l1) {
+        for (const auto& [key, value] : table->table->read_all()) {
             merged[key] = value;
         }
     }
@@ -1473,31 +1595,10 @@ void KVStore::compact_levels_locked(
     }
 
     constexpr std::size_t kTargetLevel1Bytes = 4 * 1024 * 1024;
-    std::vector<std::map<std::string, std::optional<std::string>>> chunks;
-    std::map<std::string, std::optional<std::string>> chunk;
-    std::size_t chunk_bytes = 0;
+    const auto chunks = split_entries(merged, kTargetLevel1Bytes);
 
-    for (const auto& [key, value] : merged) {
-        chunk[key] = value;
-        chunk_bytes += key.size() + 32;
-        if (value.has_value()) {
-            chunk_bytes += value->size();
-        }
-        if (chunk_bytes >= kTargetLevel1Bytes) {
-            chunks.push_back(std::move(chunk));
-            chunk.clear();
-            chunk_bytes = 0;
-        }
-    }
-    if (!chunk.empty()) {
-        chunks.push_back(std::move(chunk));
-    }
-
-    std::vector<std::uint64_t> generations;
     std::vector<Level0Table> new_tables;
-    generations.reserve(chunks.size());
     new_tables.reserve(chunks.size());
-
     for (const auto& entries : chunks) {
         if (next_sstable_generation_
             == std::numeric_limits<std::uint64_t>::max()) {
@@ -1507,13 +1608,29 @@ void KVStore::compact_levels_locked(
         const std::uint64_t generation = next_sstable_generation_++;
         const std::string path = level1_path_for_generation(generation);
         SSTable::build(path, entries);
-        auto table = std::make_shared<SSTable>(path, block_cache_);
-        generations.push_back(generation);
         new_tables.push_back(Level0Table{
             generation,
             path,
-            std::move(table)
+            std::make_shared<SSTable>(path, block_cache_)
         });
+    }
+
+    std::vector<Level0Table> combined = std::move(kept_l1);
+    combined.insert(
+        combined.end(),
+        std::make_move_iterator(new_tables.begin()),
+        std::make_move_iterator(new_tables.end()));
+    std::sort(
+        combined.begin(),
+        combined.end(),
+        [](const Level0Table& left, const Level0Table& right) {
+            return left.generation < right.generation;
+        });
+
+    std::vector<std::uint64_t> generations;
+    generations.reserve(combined.size());
+    for (const auto& table : combined) {
+        generations.push_back(table.generation);
     }
 
     ManifestState state = manifest_;
@@ -1522,7 +1639,125 @@ void KVStore::compact_levels_locked(
     publish_manifest(std::move(state));
 
     level0_tables_.clear();
-    level1_tables_ = std::move(new_tables);
+    level1_tables_ = std::move(combined);
+
+    if (level1_to_level2_trigger_bytes_ != 0) {
+        std::uintmax_t level1_bytes = 0;
+        for (const auto& table : level1_tables_) {
+            level1_bytes += std::filesystem::file_size(table.path);
+        }
+        if (level1_bytes >= level1_to_level2_trigger_bytes_) {
+            compact_l1_to_l2_locked(lock);
+        }
+    }
+    cleanup_obsolete_files();
+}
+
+void KVStore::compact_l1_to_l2() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    rethrow_background_error_locked();
+    compact_l1_to_l2_locked(lock);
+}
+
+void KVStore::compact_l1_to_l2_locked(
+    std::unique_lock<std::mutex>&
+) {
+    if (log_path_.empty() || level1_tables_.empty()) {
+        return;
+    }
+
+    std::string l1_min;
+    std::string l1_max;
+    bool has_range = false;
+    for (const auto& table : level1_tables_) {
+        const auto range = table.table->user_key_range();
+        if (!has_range) {
+            l1_min = range.first;
+            l1_max = range.second;
+            has_range = true;
+        } else {
+            l1_min = std::min(l1_min, range.first);
+            l1_max = std::max(l1_max, range.second);
+        }
+    }
+    if (!has_range) {
+        return;
+    }
+
+    std::vector<Level0Table> kept_l2;
+    std::vector<const Level0Table*> selected_l2;
+    for (const auto& table : level2_tables_) {
+        const auto range = table.table->user_key_range();
+        const bool overlaps =
+            !(range.second < l1_min || range.first > l1_max);
+        if (overlaps) {
+            selected_l2.push_back(&table);
+        } else {
+            kept_l2.push_back(table);
+        }
+    }
+
+    std::map<std::string, std::optional<std::string>> merged;
+    for (const auto* table : selected_l2) {
+        for (const auto& [key, value] : table->table->read_all()) {
+            merged[key] = value;
+        }
+    }
+    for (const auto& table : level1_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            merged[key] = value;
+        }
+    }
+    if (merged.empty()) {
+        return;
+    }
+
+    constexpr std::size_t kTargetLevel2Bytes = 4 * 1024 * 1024;
+    const auto chunks = split_entries(merged, kTargetLevel2Bytes);
+
+    std::vector<Level0Table> new_tables;
+    new_tables.reserve(chunks.size());
+    for (const auto& entries : chunks) {
+        if (next_sstable_generation_
+            == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::runtime_error(
+                "SSTable generation number is exhausted");
+        }
+        const std::uint64_t generation = next_sstable_generation_++;
+        const std::string path = level2_path_for_generation(generation);
+        SSTable::build(path, entries);
+        new_tables.push_back(Level0Table{
+            generation,
+            path,
+            std::make_shared<SSTable>(path, block_cache_)
+        });
+    }
+
+    std::vector<Level0Table> combined = std::move(kept_l2);
+    combined.insert(
+        combined.end(),
+        std::make_move_iterator(new_tables.begin()),
+        std::make_move_iterator(new_tables.end()));
+    std::sort(
+        combined.begin(),
+        combined.end(),
+        [](const Level0Table& left, const Level0Table& right) {
+            return left.generation < right.generation;
+        });
+
+    std::vector<std::uint64_t> generations;
+    generations.reserve(combined.size());
+    for (const auto& table : combined) {
+        generations.push_back(table.generation);
+    }
+
+    ManifestState state = manifest_;
+    state.level1.clear();
+    state.level2 = generations;
+    publish_manifest(std::move(state));
+
+    level1_tables_.clear();
+    level2_tables_ = std::move(combined);
     cleanup_obsolete_files();
 }
 
@@ -1701,6 +1936,18 @@ KVStore::inspect_entries(std::size_t limit) const {
         }
     }
 
+    for (auto table = level2_tables_.rbegin();
+         table != level2_tables_.rend();
+         ++table) {
+        const std::string layer =
+            "L2#" + std::to_string(table->generation);
+        for (const auto& [key, value] : table->table->read_all()) {
+            if (!push(layer, key, value)) {
+                return rows;
+            }
+        }
+    }
+
     if (!index_.empty()) {
         std::ifstream input(base_path_, std::ios::binary);
         if (!input.is_open()) {
@@ -1827,6 +2074,25 @@ KVStore::explain_key(const std::string& key) const {
         );
     }
 
+    for (auto table = level2_tables_.rbegin();
+         table != level2_tables_.rend();
+         ++table) {
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            add(
+                "L2#" + std::to_string(table->generation),
+                false,
+                std::nullopt);
+            continue;
+        }
+        const auto match = probe(result.key, result.value);
+        add(
+            "L2#" + std::to_string(table->generation),
+            match.found,
+            match.value
+        );
+    }
+
     const auto base = index_.lower_bound(seek);
     if (base == index_.end()) {
         add("BASE", false, std::nullopt);
@@ -1855,7 +2121,8 @@ std::vector<KVStore::TableInfo> KVStore::inspect_tables() const {
 
     std::vector<TableInfo> tables;
     tables.reserve(
-        level0_tables_.size() + level1_tables_.size() + 1);
+        level0_tables_.size() + level1_tables_.size()
+        + level2_tables_.size() + 1);
 
     for (const auto& table : level0_tables_) {
         tables.push_back(TableInfo{
@@ -1869,6 +2136,15 @@ std::vector<KVStore::TableInfo> KVStore::inspect_tables() const {
     for (const auto& table : level1_tables_) {
         tables.push_back(TableInfo{
             "L1",
+            table.generation,
+            table.path,
+            table.table->entry_count()
+        });
+    }
+
+    for (const auto& table : level2_tables_) {
+        tables.push_back(TableInfo{
+            "L2",
             table.generation,
             table.path,
             table.table->entry_count()
@@ -2072,6 +2348,11 @@ KVStore::snapshot_locked(std::uint64_t sequence) const {
         }
     }
     for (const auto& table : level1_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            consider(key, value);
+        }
+    }
+    for (const auto& table : level2_tables_) {
         for (const auto& [key, value] : table.table->read_all()) {
             consider(key, value);
         }
@@ -2498,6 +2779,12 @@ KVStore::StreamingIterator KVStore::new_streaming_iterator(
         }
         for (auto table = level1_tables_.rbegin();
              table != level1_tables_.rend();
+             ++table) {
+            sources.push_back(std::make_unique<
+                StreamingIterator::Impl::TableSource>(table->table));
+        }
+        for (auto table = level2_tables_.rbegin();
+             table != level2_tables_.rend();
              ++table) {
             sources.push_back(std::make_unique<
                 StreamingIterator::Impl::TableSource>(table->table));

@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct SSTableLookupResult {
@@ -106,6 +107,9 @@ public:
 
     // Bloom filter on user keys (safe negative: false means no version exists).
     bool might_contain_user(const std::string& user_key) const;
+
+    // Inclusive user-key range. Used to select overlapping tables.
+    std::pair<std::string, std::string> user_key_range() const;
 
 private:
     struct IndexEntry {

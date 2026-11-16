@@ -11,6 +11,7 @@ struct ManifestState {
     std::uint64_t retired_through = 0;
     std::vector<std::uint64_t> level0;
     std::vector<std::uint64_t> level1;
+    std::vector<std::uint64_t> level2;
 };
 
 ManifestState read_manifest(const std::string& path);

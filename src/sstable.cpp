@@ -539,6 +539,25 @@ SSTable::Entries SSTable::read_all() const {
     return entries;
 }
 
+std::pair<std::string, std::string> SSTable::user_key_range() const {
+    if (index_.empty()) {
+        return {};
+    }
+
+    const auto decode = [](const std::string& internal) {
+        std::string user;
+        std::uint64_t sequence = 0;
+        bool tombstone = false;
+        if (kvstore_internal::decode_internal_key(
+                internal, user, sequence, tombstone)) {
+            return user;
+        }
+        return internal;
+    };
+
+    return {decode(index_.front().key), decode(index_.back().key)};
+}
+
 std::size_t SSTable::entry_count() const noexcept {
     return index_.size();
 }
