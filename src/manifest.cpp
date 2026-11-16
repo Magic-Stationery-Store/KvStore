@@ -77,6 +77,16 @@ void validate(const ManifestState& state) {
         }
         previous = generation;
     }
+    previous = 0;
+    for (const auto generation : state.level3) {
+        if (generation == 0 || generation >= state.next_generation) {
+            throw std::runtime_error("Invalid MANIFEST L3 ordering");
+        }
+        if (generation <= previous) {
+            throw std::runtime_error("Invalid MANIFEST L3 ordering");
+        }
+        previous = generation;
+    }
 }
 
 } // namespace
@@ -156,6 +166,19 @@ ManifestState read_manifest(const std::string& path) {
             throw std::runtime_error("Incomplete MANIFEST");
         }
     }
+    if (section == "L3") {
+        const auto level3_count = number(input);
+        if (level3_count > 1000000) {
+            throw std::runtime_error("Too many MANIFEST tables");
+        }
+        for (std::uint64_t i = 0; i < level3_count; ++i) {
+            expect_token(input, "TABLE");
+            state.level3.push_back(number(input));
+        }
+        if (!(input >> section)) {
+            throw std::runtime_error("Incomplete MANIFEST");
+        }
+    }
     if (section != "END") {
         throw std::runtime_error("Invalid MANIFEST section");
     }
@@ -176,6 +199,8 @@ void write_manifest(const std::string& path, const ManifestState& state) {
     for (const auto id : state.level1) { payload << "TABLE " << id << '\n'; }
     payload << "L2 " << state.level2.size() << '\n';
     for (const auto id : state.level2) { payload << "TABLE " << id << '\n'; }
+    payload << "L3 " << state.level3.size() << '\n';
+    for (const auto id : state.level3) { payload << "TABLE " << id << '\n'; }
     payload << "END\n";
     const std::string text = payload.str();
     const std::string temporary = path + ".tmp";

@@ -130,6 +130,9 @@ private:
     std::shared_ptr<const BlockCache::Block> load_block(
         std::size_t block_index) const;
 
+    void load_footer();
+    void build_block_index();
+
     void bloom_add(const std::string& key);
     bool bloom_maybe(const std::string& key) const;
 
@@ -137,6 +140,7 @@ private:
     std::vector<IndexEntry> index_;
     std::vector<BlockRef> blocks_;
     std::vector<std::size_t> block_for_index_;
+    std::uint64_t data_end_ = 0;
     std::shared_ptr<BlockCache> cache_;
     std::vector<std::uint64_t> bloom_bits_;
     std::uint32_t bloom_hash_count_ = 3;

@@ -12,6 +12,7 @@ struct ManifestState {
     std::vector<std::uint64_t> level0;
     std::vector<std::uint64_t> level1;
     std::vector<std::uint64_t> level2;
+    std::vector<std::uint64_t> level3;
 };
 
 ManifestState read_manifest(const std::string& path);

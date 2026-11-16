@@ -1,10 +1,13 @@
 #include "sstable.h"
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -69,6 +72,38 @@ int main() {
         const auto result = reopened.get("apple");
         expect(result.found && result.value == "red",
                "SSTable survives reopen");
+        expect(reopened.might_contain_user("apple"),
+               "Bloom filter is restored from the footer");
+        const auto range = reopened.user_key_range();
+        expect(range == std::make_pair(
+                   std::string("apple"), std::string("zebra")),
+               "user-key range is restored from the footer");
+    }
+
+    {
+        const std::string corrupt = path + ".corrupt";
+        std::filesystem::remove(corrupt);
+        std::filesystem::copy_file(path, corrupt);
+        {
+            std::fstream file(
+                corrupt,
+                std::ios::binary | std::ios::in | std::ios::out);
+            const auto size = std::filesystem::file_size(corrupt);
+            file.seekg(static_cast<std::streamoff>(size - 1));
+            char byte = 0;
+            file.get(byte);
+            byte ^= 0x01;
+            file.seekp(static_cast<std::streamoff>(size - 1));
+            file.put(byte);
+        }
+        bool rejected = false;
+        try {
+            SSTable damaged(corrupt);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        expect(rejected, "corrupt footer rejects SSTable open");
+        std::filesystem::remove(corrupt);
     }
 
     bool overwrite_rejected = false;

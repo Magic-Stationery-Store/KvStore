@@ -52,6 +52,9 @@ class KVStore{
     // Merge L1 into L2, selecting only L2 tables that overlap the L1 range.
     void compact_l1_to_l2();
 
+    // Merge L2 into L3, selecting only L3 tables that overlap the L2 range.
+    void compact_l2_to_l3();
+
     // 0 disables the automatic L0 -> L1 trigger; default is 4.
     void set_level0_compaction_trigger(std::size_t count);
     std::size_t level0_compaction_trigger() const;
@@ -59,6 +62,10 @@ class KVStore{
     // 0 disables automatic L1 -> L2; default is 16 MiB.
     void set_level1_to_level2_trigger_bytes(std::size_t bytes);
     std::size_t level1_to_level2_trigger_bytes() const;
+
+    // 0 disables automatic L2 -> L3; default is 32 MiB.
+    void set_level2_to_level3_trigger_bytes(std::size_t bytes);
+    std::size_t level2_to_level3_trigger_bytes() const;
 
     // ---- Read-only inspection (debugging tools, GUI) -------------------
     // These helpers take the same mutex as normal reads; they never mutate
@@ -284,6 +291,10 @@ class KVStore{
         std::unique_lock<std::mutex>& lock
     );
 
+    void compact_l2_to_l3_locked(
+        std::unique_lock<std::mutex>& lock
+    );
+
     void rethrow_background_error_locked() const;
 
     void recover_immutable_wals();
@@ -300,6 +311,10 @@ class KVStore{
     ) const;
 
     std::string level2_path_for_generation(
+        std::uint64_t generation
+    ) const;
+
+    std::string level3_path_for_generation(
         std::uint64_t generation
     ) const;
 
@@ -344,11 +359,16 @@ class KVStore{
     // L2 is the next level; it is built by compact_l1_to_l2().
     std::vector<Level0Table> level2_tables_;
 
+    // L3 is built by compact_l2_to_l3().
+    std::vector<Level0Table> level3_tables_;
+
     std::uint64_t next_sstable_generation_ = 1;
 
     std::size_t level0_compaction_trigger_ = 4;
 
     std::size_t level1_to_level2_trigger_bytes_ = 16 * 1024 * 1024;
+
+    std::size_t level2_to_level3_trigger_bytes_ = 32 * 1024 * 1024;
 
     std::size_t memtable_entry_limit_ = 64;
 

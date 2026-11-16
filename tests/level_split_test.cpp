@@ -88,6 +88,7 @@ int main() {
         KVStore store(auto_l2_path, 2);
         store.set_level0_compaction_trigger(2);
         store.set_level1_to_level2_trigger_bytes(1);
+        store.set_level2_to_level3_trigger_bytes(0);
 
         for (int batch = 0; batch < 2; ++batch) {
             store.put("auto-l2-" + std::to_string(batch) + "-a", "a");
@@ -107,6 +108,36 @@ int main() {
     reset_test_database(auto_l2_path);
     std::remove(auto_l2_path.c_str());
     std::remove((auto_l2_path + ".wal").c_str());
+
+    const std::string auto_l3_path = "level-auto-l3-test.log";
+    reset_test_database(auto_l3_path);
+    std::remove(auto_l3_path.c_str());
+    std::remove((auto_l3_path + ".wal").c_str());
+    {
+        KVStore store(auto_l3_path, 2);
+        store.set_level0_compaction_trigger(2);
+        store.set_level1_to_level2_trigger_bytes(1);
+        store.set_level2_to_level3_trigger_bytes(1);
+
+        for (int batch = 0; batch < 2; ++batch) {
+            store.put("auto-l3-" + std::to_string(batch) + "-a", "a");
+            store.put("auto-l3-" + std::to_string(batch) + "-b", "b");
+            store.flush();
+        }
+
+        expect(count_tables(store, "L0") == 0
+                   && count_tables(store, "L1") == 0
+                   && count_tables(store, "L2") == 0,
+               "automatic L0->L1->L2->L3 clears upper levels");
+        expect(count_tables(store, "L3") >= 1,
+               "automatic L2->L3 creates L3");
+        expect(store.get("auto-l3-0-a") == "a"
+                   && store.get("auto-l3-1-b") == "b",
+               "automatic L3 keeps all values");
+    }
+    reset_test_database(auto_l3_path);
+    std::remove(auto_l3_path.c_str());
+    std::remove((auto_l3_path + ".wal").c_str());
 
     const std::string split_path = "level-split-test.log";
     reset_test_database(split_path);
@@ -167,22 +198,36 @@ int main() {
         expect(second_manifest.level1.empty()
                    && second_manifest.level2.size() >= 2,
                "MANIFEST records L2 and clears L1");
+
+        store.compact_l2_to_l3();
+        expect(count_tables(store, "L2") == 0,
+               "L2 to L3 compaction clears L2");
+        expect(count_tables(store, "L3") >= 2,
+               "L2 to L3 compaction splits L3");
+        expect(store.get(key(0)) == "partial"
+                   && store.get(key(5999)) == value,
+               "values survive L2 to L3 compaction");
+
+        const auto third_manifest = store.manifest_snapshot();
+        expect(third_manifest.level2.empty()
+                   && third_manifest.level3.size() >= 2,
+               "MANIFEST records L3 and clears L2");
     }
 
     {
         KVStore reopened(split_path, 10000);
-        expect(count_tables(reopened, "L2") >= 2,
-               "reopen loads all split L2 tables");
+        expect(count_tables(reopened, "L3") >= 2,
+               "reopen loads all split L3 tables");
         expect(reopened.get(key(0)) == "partial"
                    && reopened.get(key(5999)) == std::string(1024, 'v'),
-               "values survive reopening split L2 tables");
+               "values survive reopening split L3 tables");
 
         reopened.compact();
-        expect(count_tables(reopened, "L2") == 0,
-               "full compaction consumes L2");
+        expect(count_tables(reopened, "L3") == 0,
+               "full compaction consumes L3");
         expect(reopened.get(key(0)) == "partial"
                    && reopened.get(key(5999)) == std::string(1024, 'v'),
-               "full compaction preserves L2 values");
+               "full compaction preserves L3 values");
     }
 
     reset_test_database(split_path);

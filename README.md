@@ -30,11 +30,13 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   无快照时每个 key 只保留最新版本。
 - **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
   sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
-- **部分分层压缩**：L0→L1 默认 L0 表数 ≥ 4 自动触发，只重建与 L0 key range
-  重叠的 L1 表；L1→L2 默认 L1 ≥ 16 MiB 自动触发，只重建与 L1 重叠的 L2 表。
-  L1/L2 均按约 4 MiB 拆成 key-range 不重叠的表，BASE 不动。
-- **块式 SSTable + Bloom + Block Cache**：L0 按约 4 KiB 分块，打开时建立块索引和
-  user-key Bloom Filter；读路径先 Bloom 过滤，再按块加载，LRU Block Cache 默认 8 MiB。
+- **部分分层压缩**：L0→L1 默认 L0 表数 ≥ 4 自动触发；L1→L2 默认 16 MiB；
+  L2→L3 默认 32 MiB。每层只重建与上层 key range 重叠的表，L1/L2/L3 均按
+  约 4 MiB 拆成 key-range 不重叠的表，BASE 不动。
+- **SSTable v2 footer**：记录级索引、Bloom、user-key range 持久化到文件尾部；
+  打开时只读 footer，不再扫描全部记录；旧 v1 表仍可扫描打开。
+- **块式 SSTable + Bloom + Block Cache**：L0 按约 4 KiB 分块，Bloom 从 footer
+  加载；读路径先 Bloom 过滤，再按块加载，LRU Block Cache 默认 8 MiB。
 - **快照迭代器**：`new_iterator()` 跨所有层做多路归并，
   提供 `Seek/Next` 并跳过墓碑；物化一份有序快照，适合小数据量和调试。
 - **流式 MergingIterator**：`new_streaming_iterator()` 每层一个游标，按内部键归并，
@@ -56,6 +58,8 @@ store.set_level0_compaction_trigger(4);           // 0 disables auto L0->L1
 store.compact_levels();                          // explicit L0 -> L1
 store.set_level1_to_level2_trigger_bytes(16 * 1024 * 1024);
 store.compact_l1_to_l2();                        // explicit L1 -> L2
+store.set_level2_to_level3_trigger_bytes(32 * 1024 * 1024);
+store.compact_l2_to_l3();                        // explicit L2 -> L3
 
 KVStore::WriteBatch batch;
 batch.put("a", "1");
@@ -78,11 +82,12 @@ store.write(batch);                  // one WAL record, all-or-nothing
       → L0 从新到旧
       → L1（Bloom 过滤 + 块读取）
       → L2（Bloom 过滤 + 块读取）
+      → L3（Bloom 过滤 + 块读取）
       → BASE 内存索引 + 磁盘读值
 
-Compact：冻结并等待后台 → 合并 BASE + 全部 L0 + L1 + L2 + Active
+Compact：冻结并等待后台 → 合并 BASE + 全部 L0 + L1 + L2 + L3 + Active
       → 写新 BASE（tmp → fsync → rename）
-      → 一次 MANIFEST 提交（BASE/RETIRED 前进、L0/L1/L2 清空）
+      → 一次 MANIFEST 提交（BASE/RETIRED 前进、L0/L1/L2/L3 清空）
       → 回收旧文件、重置 WAL
 
 L0→L1：只选与 L0 key range 重叠的 L1 表，和全部 L0 合并
@@ -90,6 +95,9 @@ L0→L1：只选与 L0 key range 重叠的 L1 表，和全部 L0 合并
 
 L1→L2：只选与 L1 key range 重叠的 L2 表，和全部 L1 合并
       → 按 4 MiB 拆成新 L2；未重叠 L2 保留；L1 清空
+
+L2→L3：只选与 L2 key range 重叠的 L3 表，和全部 L2 合并
+      → 按 4 MiB 拆成新 L3；未重叠 L3 保留；L2 清空
 ```
 
 ## 磁盘文件
@@ -101,6 +109,7 @@ L1→L2：只选与 L1 key range 重叠的 L2 表，和全部 L1 合并
 | `kvstore.log.L0.<20位编号>.sst` | L0 表，有效性由 MANIFEST 决定 |
 | `kvstore.log.L1.<20位编号>.sst` | L1 表，key range 互不重叠 |
 | `kvstore.log.L2.<20位编号>.sst` | L2 表，key range 互不重叠 |
+| `kvstore.log.L3.<20位编号>.sst` | L3 表，key range 互不重叠 |
 | `kvstore.log.manifest` | 完整版本快照（文本 + CRC32） |
 | `kvstore.log.base.<20位编号>.log` | Compact 生成的基础数据 |
 | `kvstore.log` | 旧格式基础文件（仅 `BASE 0` 时使用） |
@@ -108,6 +117,9 @@ L1→L2：只选与 L1 key range 重叠的 L2 表，和全部 L1 合并
 
 记录格式：8 字节文件头（`KVDB` + 版本号），随后每条记录为
 `u8 op | u32 key_len | u32 value_len | key | value | u32 crc32`。
+
+L0–L3 SSTable 使用 v2 格式：文件头 + 记录 + footer（记录索引、Bloom、
+user-key range、CRC32）；打开时只读 footer，v1 表回退到全表扫描。
 
 ## 构建与测试（Linux / WSL）
 
@@ -120,8 +132,8 @@ ctest --test-dir build-ubuntu --output-on-failure
 当前 22 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
 并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
 WriteBatch 原子提交、快照感知 GC、流式迭代器与范围扫描、块式 SSTable/Bloom/
-Block Cache、L0→L1 部分压缩与 4 MiB 拆分、L1→L2 部分压缩，以及可视化控制台
-使用的只读观测接口。
+Block Cache、SSTable v2 footer、L0→L1、L1→L2、L2→L3 部分压缩，以及可视化
+控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -147,7 +159,8 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 22/22 通过；`-DKVSTORE_SANITIZER=thread` 构建下 21 项通过
+实测 ASan/UBSan 下 22/22 通过；TSan 逐项运行通过，整套串跑偶发 TSan
+allocator 误报（WSL/glibc 环境），不作为代码 race 结论。
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -254,11 +267,12 @@ cmake --build build-qt
 | --- | --- | --- |
 | 每 key 全量内存索引 + 块索引 | 块读取/Bloom 降低读放大，实现比 B+ 树简单 | 大库索引仍占内存 |
 | LRU Block Cache（8 MiB） | 热点块复用，避免重复解析 | 额外内存；冷启动有 miss |
-| L1/L2 按 4 MiB 拆分 + 部分压缩 | 控制单表大小，只重写重叠表 | 需要维护每表 key range |
+| L1/L2/L3 按 4 MiB 拆分 + 部分压缩 | 控制单表大小，只重写重叠表 | 需要维护每表 key range |
+| SSTable v2 footer | 打开只读 footer，不扫全表 | footer 损坏需拒绝/回退 |
 | 全量文本 MANIFEST | 一次替换提交整个版本，易校验 | 每次 Flush 重写整份清单 |
 | 单后台线程 + 单 Immutable 槽位 | 天然背压，状态简单 | 前台写入可能被阻塞 |
 | Compact 持锁 | 实现简单、版本一致 | 压缩期间阻塞读写 |
-| 记录级 CRC | 能定位损坏记录 | SSTable 整体无校验和 |
+| 记录级 CRC + footer CRC | 能定位损坏记录和元数据 | 仍无整文件校验和 |
 
 ## 目录结构
 
@@ -280,6 +294,8 @@ docs/                   截图与文档
 - [ ] 磁盘满 / EIO 故障注入
 - [x] L0 → L1 分层压缩（默认 L0≥4 自动触发，L1 按 4 MiB 拆分）
 - [x] L1 → L2 部分分层压缩（默认 L1≥16 MiB 自动触发）
+- [x] L2 → L3 部分分层压缩（默认 L2≥32 MiB 自动触发）
+- [x] SSTable v2 footer（索引 / Bloom / key range，兼容 v1 扫描）
 - [x] SSTable 块索引 + Bloom Filter
 - [x] LRU Block Cache（默认 8 MiB）
 - [x] 快照迭代器（Seek/Next，跳过墓碑）
