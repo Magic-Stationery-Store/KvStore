@@ -57,6 +57,16 @@ void validate(const ManifestState& state) {
         }
         previous = generation;
     }
+    previous = 0;
+    for (const auto generation : state.level1) {
+        if (generation == 0 || generation >= state.next_generation) {
+            throw std::runtime_error("Invalid MANIFEST L1 ordering");
+        }
+        if (generation <= previous) {
+            throw std::runtime_error("Invalid MANIFEST L1 ordering");
+        }
+        previous = generation;
+    }
 }
 
 } // namespace
@@ -105,7 +115,24 @@ ManifestState read_manifest(const std::string& path) {
     for (std::uint64_t i = 0; i < count; ++i) {
         expect_token(input, "TABLE"); state.level0.push_back(number(input));
     }
-    expect_token(input, "END");
+
+    std::string section;
+    if (!(input >> section)) {
+        throw std::runtime_error("Incomplete MANIFEST");
+    }
+    if (section == "L1") {
+        const auto level1_count = number(input);
+        if (level1_count > 1000000) {
+            throw std::runtime_error("Too many MANIFEST tables");
+        }
+        for (std::uint64_t i = 0; i < level1_count; ++i) {
+            expect_token(input, "TABLE");
+            state.level1.push_back(number(input));
+        }
+        expect_token(input, "END");
+    } else if (section != "END") {
+        throw std::runtime_error("Invalid MANIFEST section");
+    }
     if (input >> extra) { throw std::runtime_error("Unexpected MANIFEST data"); }
     validate(state);
     return state;
@@ -119,6 +146,8 @@ void write_manifest(const std::string& path, const ManifestState& state) {
             << "\nRETIRED " << state.retired_through
             << "\nL0 " << state.level0.size() << '\n';
     for (const auto id : state.level0) { payload << "TABLE " << id << '\n'; }
+    payload << "L1 " << state.level1.size() << '\n';
+    for (const auto id : state.level1) { payload << "TABLE " << id << '\n'; }
     payload << "END\n";
     const std::string text = payload.str();
     const std::string temporary = path + ".tmp";

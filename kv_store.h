@@ -45,6 +45,11 @@ class KVStore{
 
     void compact();
 
+    // Merge all L0 tables (and the current L1 table, if any) into a new L1
+    // table. BASE is left untouched. This is explicit; callers decide when
+    // the L0 count is high enough.
+    void compact_levels();
+
     // ---- Read-only inspection (debugging tools, GUI) -------------------
     // These helpers take the same mutex as normal reads; they never mutate
     // storage.  Values from the base file are read on demand.
@@ -272,6 +277,10 @@ class KVStore{
         std::uint64_t generation
     ) const;
 
+    std::string level1_path_for_generation(
+        std::uint64_t generation
+    ) const;
+
     std::string immutable_wal_path_for_generation(
         std::uint64_t generation
     ) const;
@@ -305,6 +314,10 @@ class KVStore{
 
     // Stored from oldest to newest. Reads walk this vector backwards.
     std::vector<Level0Table> level0_tables_;
+
+    // L1 tables have disjoint key ranges. The current implementation keeps
+    // one L1 table at a time and rebuilds it from L0.
+    std::vector<Level0Table> level1_tables_;
 
     std::uint64_t next_sstable_generation_ = 1;
 

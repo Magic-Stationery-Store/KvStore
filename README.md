@@ -30,6 +30,8 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   无快照时每个 key 只保留最新版本。
 - **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
   sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
+- **L0 → L1 分层压缩**：`compact_levels()` 把全部 L0 与现有 L1 合并成新 L1，BASE 不动；
+  当前保持单张 L1 表，保留版本与墓碑；`compact()` 仍做 BASE 全量压缩。
 - **块式 SSTable + Bloom + Block Cache**：L0 按约 4 KiB 分块，打开时建立块索引和
   user-key Bloom Filter；读路径先 Bloom 过滤，再按块加载，LRU Block Cache 默认 8 MiB。
 - **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
@@ -49,6 +51,7 @@ auto iterator = store.new_iterator(snapshot);
 
 auto streaming = store.new_streaming_iterator(snapshot);
 auto rows = store.scan("a", "z", 100, snapshot);  // [a, z)
+store.compact_levels();                          // L0 -> L1
 
 KVStore::WriteBatch batch;
 batch.put("a", "1");
@@ -69,12 +72,17 @@ store.write(batch);                  // one WAL record, all-or-nothing
 读：Active MemTable
       → Immutable MemTable
       → L0 从新到旧
+      → L1（Bloom 过滤 + 块读取）
       → BASE 内存索引 + 磁盘读值
 
-Compact：冻结并等待后台 → 合并 BASE + 全部 L0 + Active
+Compact：冻结并等待后台 → 合并 BASE + 全部 L0 + L1 + Active
       → 写新 BASE（tmp → fsync → rename）
-      → 一次 MANIFEST 提交（BASE/RETIRED 前进、L0 清空）
+      → 一次 MANIFEST 提交（BASE/RETIRED 前进、L0/L1 清空）
       → 回收旧文件、重置 WAL
+
+L0→L1：compact_levels() 合并现有 L1 + 全部 L0
+      → 写新 L1（tmp → fsync → rename）
+      → MANIFEST 把 L1 指向新表、清空 L0；BASE 不动
 ```
 
 ## 磁盘文件
@@ -100,10 +108,10 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 20 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+当前 21 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
 并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
 WriteBatch 原子提交、快照感知 GC、流式迭代器与范围扫描、块式 SSTable/Bloom/
-Block Cache，以及可视化控制台使用的只读观测接口。
+Block Cache、L0→L1 分层压缩，以及可视化控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -129,7 +137,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 20/20 通过；`-DKVSTORE_SANITIZER=thread` 构建下 19 项通过
+实测 ASan/UBSan 下 21/21 通过；`-DKVSTORE_SANITIZER=thread` 构建下 20 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -236,6 +244,7 @@ cmake --build build-qt
 | --- | --- | --- |
 | 每 key 全量内存索引 + 块索引 | 块读取/Bloom 降低读放大，实现比 B+ 树简单 | 大库索引仍占内存 |
 | LRU Block Cache（8 MiB） | 热点块复用，避免重复解析 | 额外内存；冷启动有 miss |
+| 单张 L1 表 | L0→L1 合并直接、元数据少 | L1 过大时需按 key range 拆分 |
 | 全量文本 MANIFEST | 一次替换提交整个版本，易校验 | 每次 Flush 重写整份清单 |
 | 单后台线程 + 单 Immutable 槽位 | 天然背压，状态简单 | 前台写入可能被阻塞 |
 | Compact 持锁 | 实现简单、版本一致 | 压缩期间阻塞读写 |
@@ -248,7 +257,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  20 个端到端测试
+tests/                  21 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -259,7 +268,8 @@ docs/                   截图与文档
 - [x] SIGKILL 崩溃恢复循环（200 次）
 - [x] ASan/UBSan/TSan 验证
 - [ ] 磁盘满 / EIO 故障注入
-- [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
+- [x] L0 → L1 分层压缩（显式 `compact_levels()`，单张 L1）
+- [ ] L1 按 key range/大小拆分，部分压缩时保留墓碑
 - [x] SSTable 块索引 + Bloom Filter
 - [x] LRU Block Cache（默认 8 MiB）
 - [x] 快照迭代器（Seek/Next，跳过墓碑）

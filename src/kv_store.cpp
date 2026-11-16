@@ -459,6 +459,22 @@ KVStore::LookupResult KVStore::lookup_locked(
         }
     }
 
+    for (auto table = level1_tables_.rbegin();
+         table != level1_tables_.rend();
+         ++table) {
+        if (!table->table->might_contain_user(key)) {
+            continue;
+        }
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            continue;
+        }
+        const auto match = matches(result.key, result.value);
+        if (match.has_value()) {
+            return *match;
+        }
+    }
+
     const auto base = index_.lower_bound(seek);
     if (base == index_.end()) {
         return LookupResult{};
@@ -751,6 +767,22 @@ std::string KVStore::sstable_path_for_generation(
     return (base.parent_path() / filename.str()).string();
 }
 
+std::string KVStore::level1_path_for_generation(
+    std::uint64_t generation
+) const {
+    const std::filesystem::path base =
+        std::filesystem::absolute(log_path_).lexically_normal();
+    std::ostringstream filename;
+    filename
+        << base.filename().string()
+        << ".L1."
+        << std::setw(20)
+        << std::setfill('0')
+        << generation
+        << ".sst";
+    return (base.parent_path() / filename.str()).string();
+}
+
 std::string KVStore::immutable_wal_path_for_generation(
     std::uint64_t generation
 ) const {
@@ -800,6 +832,18 @@ void KVStore::initialize_manifest() {
                 generation, path, std::move(table)
             });
         }
+        for (const auto generation : manifest_.level1) {
+            const std::string path =
+                level1_path_for_generation(generation);
+            auto table = std::make_shared<SSTable>(path, block_cache_);
+            for (const auto& [key, value] : table->read_all()) {
+                (void)value;
+                observe_internal_key(key);
+            }
+            level1_tables_.push_back(Level0Table{
+                generation, path, std::move(table)
+            });
+        }
         return;
     }
 
@@ -843,14 +887,19 @@ void KVStore::cleanup_obsolete_files() {
         if (!item.is_regular_file()) { continue; }
         const std::string filename = item.path().filename().string();
         const auto table = parse_id(filename, name + ".L0.", ".sst");
+        const auto level1 = parse_id(filename, name + ".L1.", ".sst");
         const auto base = parse_id(filename, name + ".base.", ".log");
         const bool obsolete_table = table && !std::binary_search(
             manifest_.level0.begin(), manifest_.level0.end(), *table);
+        const bool obsolete_level1 = level1 && !std::binary_search(
+            manifest_.level1.begin(), manifest_.level1.end(), *level1);
         const bool obsolete_base = base && *base != manifest_.base_generation;
         const bool temporary = parse_id(filename, name + ".L0.", ".sst.tmp")
+            || parse_id(filename, name + ".L1.", ".sst.tmp")
             || parse_id(filename, name + ".base.", ".log.tmp")
             || filename == name + ".manifest.tmp";
-        if (obsolete_table || obsolete_base || temporary) {
+        if (obsolete_table || obsolete_level1
+            || obsolete_base || temporary) {
             std::filesystem::remove(item.path());
             removed = true;
         }
@@ -1240,6 +1289,11 @@ void KVStore::compact() {
             merged[key] = value;
         }
     }
+    for (const auto& table : level1_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            merged[key] = value;
+        }
+    }
     for (const auto& [key, value] : memtable_) {
         merged[key] = value;
     }
@@ -1362,9 +1416,64 @@ void KVStore::compact() {
     base_path_ = new_base;
     index_ = std::move(new_index);
     level0_tables_.clear();
+    level1_tables_.clear();
     replace_with_empty_log(wal_path_, ".compact.tmp");
     memtable_.clear();
     dirty_ = false;
+    cleanup_obsolete_files();
+}
+
+void KVStore::compact_levels() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    rethrow_background_error_locked();
+    if (log_path_.empty()) {
+        return;
+    }
+    if (!memtable_.empty()) {
+        freeze_memtable_locked(lock);
+    }
+    wait_for_background_flush_locked(lock);
+    if (level0_tables_.empty()) {
+        return;
+    }
+
+    std::map<std::string, std::optional<std::string>> merged;
+    for (const auto& table : level1_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            merged[key] = value;
+        }
+    }
+    for (const auto& table : level0_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            merged[key] = value;
+        }
+    }
+    if (merged.empty()) {
+        return;
+    }
+
+    if (next_sstable_generation_
+        == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::runtime_error("SSTable generation number is exhausted");
+    }
+    const std::uint64_t generation = next_sstable_generation_++;
+    const std::string path = level1_path_for_generation(generation);
+
+    SSTable::build(path, merged);
+    auto table = std::make_shared<SSTable>(path, block_cache_);
+
+    ManifestState state = manifest_;
+    state.level0.clear();
+    state.level1 = {generation};
+    publish_manifest(std::move(state));
+
+    level0_tables_.clear();
+    level1_tables_.clear();
+    level1_tables_.push_back(Level0Table{
+        generation,
+        path,
+        std::move(table)
+    });
     cleanup_obsolete_files();
 }
 
@@ -1531,6 +1640,18 @@ KVStore::inspect_entries(std::size_t limit) const {
         }
     }
 
+    for (auto table = level1_tables_.rbegin();
+         table != level1_tables_.rend();
+         ++table) {
+        const std::string layer =
+            "L1#" + std::to_string(table->generation);
+        for (const auto& [key, value] : table->table->read_all()) {
+            if (!push(layer, key, value)) {
+                return rows;
+            }
+        }
+    }
+
     if (!index_.empty()) {
         std::ifstream input(base_path_, std::ios::binary);
         if (!input.is_open()) {
@@ -1638,6 +1759,25 @@ KVStore::explain_key(const std::string& key) const {
         );
     }
 
+    for (auto table = level1_tables_.rbegin();
+         table != level1_tables_.rend();
+         ++table) {
+        const SSTableSeekResult result = table->table->seek(seek);
+        if (!result.found) {
+            add(
+                "L1#" + std::to_string(table->generation),
+                false,
+                std::nullopt);
+            continue;
+        }
+        const auto match = probe(result.key, result.value);
+        add(
+            "L1#" + std::to_string(table->generation),
+            match.found,
+            match.value
+        );
+    }
+
     const auto base = index_.lower_bound(seek);
     if (base == index_.end()) {
         add("BASE", false, std::nullopt);
@@ -1665,11 +1805,21 @@ std::vector<KVStore::TableInfo> KVStore::inspect_tables() const {
     rethrow_background_error_locked();
 
     std::vector<TableInfo> tables;
-    tables.reserve(level0_tables_.size() + 1);
+    tables.reserve(
+        level0_tables_.size() + level1_tables_.size() + 1);
 
     for (const auto& table : level0_tables_) {
         tables.push_back(TableInfo{
             "L0",
+            table.generation,
+            table.path,
+            table.table->entry_count()
+        });
+    }
+
+    for (const auto& table : level1_tables_) {
+        tables.push_back(TableInfo{
+            "L1",
             table.generation,
             table.path,
             table.table->entry_count()
@@ -1868,6 +2018,11 @@ KVStore::snapshot_locked(std::uint64_t sequence) const {
         }
     }
     for (const auto& table : level0_tables_) {
+        for (const auto& [key, value] : table.table->read_all()) {
+            consider(key, value);
+        }
+    }
+    for (const auto& table : level1_tables_) {
         for (const auto& [key, value] : table.table->read_all()) {
             consider(key, value);
         }
@@ -2288,6 +2443,12 @@ KVStore::StreamingIterator KVStore::new_streaming_iterator(
 
         for (auto table = level0_tables_.rbegin();
              table != level0_tables_.rend();
+             ++table) {
+            sources.push_back(std::make_unique<
+                StreamingIterator::Impl::TableSource>(table->table));
+        }
+        for (auto table = level1_tables_.rbegin();
+             table != level1_tables_.rend();
              ++table) {
             sources.push_back(std::make_unique<
                 StreamingIterator::Impl::TableSource>(table->table));

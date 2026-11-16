@@ -10,6 +10,7 @@ struct ManifestState {
     std::uint64_t base_generation = 0; // 0 selects the legacy base log.
     std::uint64_t retired_through = 0;
     std::vector<std::uint64_t> level0;
+    std::vector<std::uint64_t> level1;
 };
 
 ManifestState read_manifest(const std::string& path);

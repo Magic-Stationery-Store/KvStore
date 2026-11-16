@@ -14,6 +14,7 @@ inline void reset_test_database(const std::string& path) {
             || file == name + ".manifest" || file == name + ".manifest.tmp"
             || file == name + ".compact.tmp" || file == name + ".wal.compact.tmp"
             || file.compare(0, name.size() + 4, name + ".L0.") == 0
+            || file.compare(0, name.size() + 4, name + ".L1.") == 0
             || file.compare(0, name.size() + 6, name + ".base.") == 0
             || file.compare(0, name.size() + 8, name + ".wal.L0.") == 0;
         if (file == name || sidecar) { std::filesystem::remove(item.path()); }
