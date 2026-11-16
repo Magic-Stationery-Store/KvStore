@@ -45,10 +45,13 @@ class KVStore{
 
     void compact();
 
-    // Merge all L0 tables (and the current L1 table, if any) into a new L1
-    // table. BASE is left untouched. This is explicit; callers decide when
-    // the L0 count is high enough.
+    // Merge all L0 tables (and the current L1 tables) into new L1 tables.
+    // BASE is left untouched. L1 is split by approximately 4 MiB.
     void compact_levels();
+
+    // 0 disables the automatic L0 -> L1 trigger; default is 4.
+    void set_level0_compaction_trigger(std::size_t count);
+    std::size_t level0_compaction_trigger() const;
 
     // ---- Read-only inspection (debugging tools, GUI) -------------------
     // These helpers take the same mutex as normal reads; they never mutate
@@ -266,6 +269,10 @@ class KVStore{
 
     void background_flush_loop();
 
+    void compact_levels_locked(
+        std::unique_lock<std::mutex>& lock
+    );
+
     void rethrow_background_error_locked() const;
 
     void recover_immutable_wals();
@@ -320,6 +327,8 @@ class KVStore{
     std::vector<Level0Table> level1_tables_;
 
     std::uint64_t next_sstable_generation_ = 1;
+
+    std::size_t level0_compaction_trigger_ = 4;
 
     std::size_t memtable_entry_limit_ = 64;
 

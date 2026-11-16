@@ -93,6 +93,7 @@ int main() {
 
     {
         KVStore store(db_path, 3);
+        store.set_level0_compaction_trigger(0);
         for (std::size_t i = 0; i < 30; ++i) {
             store.put(key(i), "value-" + key(i));
         }

@@ -269,6 +269,11 @@ if(BUILD_TESTING AND UNIX)
         COMMAND kvstore_leveled_compaction_tests
     )
 
+    add_executable(kvstore_level_split_tests tests/level_split_test.cpp)
+    target_link_libraries(kvstore_level_split_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_level_split_tests)
+    add_test(NAME kvstore_level_split_tests COMMAND kvstore_level_split_tests)
+
     set_tests_properties(kvstore_background_flush_tests kvstore_manifest_tests
         PROPERTIES TIMEOUT 60)
     set_tests_properties(kvstore_crash_recovery_tests

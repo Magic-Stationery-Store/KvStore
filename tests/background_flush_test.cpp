@@ -71,6 +71,7 @@ int main() {
     // continue in a new MemTable while the worker writes the frozen snapshot.
     {
         KVStore store(path, 2);
+        store.set_level0_compaction_trigger(0);
         for (int number = 0; number < 20; ++number) {
             const std::string key =
                 "key-" + std::to_string(number);

@@ -61,6 +61,7 @@ int main() {
 
     {
         KVStore store(path, 2);
+        store.set_level0_compaction_trigger(0);
 
         store.put("k", "v1");
         std::optional<KVStore::Snapshot> old = store.snapshot();
@@ -105,6 +106,7 @@ int main() {
 
     {
         KVStore reopened(path, 2);
+        reopened.set_level0_compaction_trigger(0);
         expect(reopened.get("k") == "v2"
                    && reopened.get("key-2-a") == "a",
                "L1 table is loaded after reopen");

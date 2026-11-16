@@ -749,6 +749,10 @@ void KVStore::flush() {
         freeze_memtable_locked(lock);
     }
     wait_for_background_flush_locked(lock);
+    if (level0_compaction_trigger_ != 0
+        && level0_tables_.size() >= level0_compaction_trigger_) {
+        compact_levels_locked(lock);
+    }
 }
 
 std::string KVStore::sstable_path_for_generation(
@@ -1426,6 +1430,22 @@ void KVStore::compact() {
 void KVStore::compact_levels() {
     std::unique_lock<std::mutex> lock(mutex_);
     rethrow_background_error_locked();
+    compact_levels_locked(lock);
+}
+
+void KVStore::set_level0_compaction_trigger(std::size_t count) {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    level0_compaction_trigger_ = count;
+}
+
+std::size_t KVStore::level0_compaction_trigger() const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    return level0_compaction_trigger_;
+}
+
+void KVStore::compact_levels_locked(
+    std::unique_lock<std::mutex>& lock
+) {
     if (log_path_.empty()) {
         return;
     }
@@ -1452,28 +1472,57 @@ void KVStore::compact_levels() {
         return;
     }
 
-    if (next_sstable_generation_
-        == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::runtime_error("SSTable generation number is exhausted");
-    }
-    const std::uint64_t generation = next_sstable_generation_++;
-    const std::string path = level1_path_for_generation(generation);
+    constexpr std::size_t kTargetLevel1Bytes = 4 * 1024 * 1024;
+    std::vector<std::map<std::string, std::optional<std::string>>> chunks;
+    std::map<std::string, std::optional<std::string>> chunk;
+    std::size_t chunk_bytes = 0;
 
-    SSTable::build(path, merged);
-    auto table = std::make_shared<SSTable>(path, block_cache_);
+    for (const auto& [key, value] : merged) {
+        chunk[key] = value;
+        chunk_bytes += key.size() + 32;
+        if (value.has_value()) {
+            chunk_bytes += value->size();
+        }
+        if (chunk_bytes >= kTargetLevel1Bytes) {
+            chunks.push_back(std::move(chunk));
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+    }
+    if (!chunk.empty()) {
+        chunks.push_back(std::move(chunk));
+    }
+
+    std::vector<std::uint64_t> generations;
+    std::vector<Level0Table> new_tables;
+    generations.reserve(chunks.size());
+    new_tables.reserve(chunks.size());
+
+    for (const auto& entries : chunks) {
+        if (next_sstable_generation_
+            == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::runtime_error(
+                "SSTable generation number is exhausted");
+        }
+        const std::uint64_t generation = next_sstable_generation_++;
+        const std::string path = level1_path_for_generation(generation);
+        SSTable::build(path, entries);
+        auto table = std::make_shared<SSTable>(path, block_cache_);
+        generations.push_back(generation);
+        new_tables.push_back(Level0Table{
+            generation,
+            path,
+            std::move(table)
+        });
+    }
 
     ManifestState state = manifest_;
     state.level0.clear();
-    state.level1 = {generation};
+    state.level1 = generations;
     publish_manifest(std::move(state));
 
     level0_tables_.clear();
-    level1_tables_.clear();
-    level1_tables_.push_back(Level0Table{
-        generation,
-        path,
-        std::move(table)
-    });
+    level1_tables_ = std::move(new_tables);
     cleanup_obsolete_files();
 }
 
