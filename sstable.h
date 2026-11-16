@@ -27,6 +27,13 @@ public:
     using Entries =
         std::map<std::string, std::optional<std::string>>;
 
+    struct EntryRef {
+        std::string key;
+        std::uint64_t value_offset = 0;
+        std::uint32_t value_size = 0;
+        bool tombstone = false;
+    };
+
     // Build a new immutable table. Existing tables are never overwritten.
     static void build(
         const std::string& path,
@@ -41,6 +48,11 @@ public:
     SSTableSeekResult seek(const std::string& key) const;
 
     Entries read_all() const;
+
+    // Metadata-only snapshot for a streaming iterator (values are not copied).
+    std::vector<EntryRef> index_snapshot() const;
+
+    const std::string& path() const noexcept;
 
     std::size_t entry_count() const noexcept;
 

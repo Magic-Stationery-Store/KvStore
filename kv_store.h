@@ -128,10 +128,54 @@ class KVStore{
         std::shared_ptr<const State> state_;
     };
 
+    // Move-only streaming iterator. It keeps one cursor per layer and reads
+    // values on demand; unlike Iterator it does not materialize the database.
+    class StreamingIterator {
+    public:
+        StreamingIterator() noexcept;
+        ~StreamingIterator();
+
+        StreamingIterator(StreamingIterator&&) noexcept;
+        StreamingIterator& operator=(StreamingIterator&&) noexcept;
+
+        StreamingIterator(const StreamingIterator&) = delete;
+        StreamingIterator& operator=(const StreamingIterator&) = delete;
+
+        bool valid() const noexcept;
+        const std::string& key() const;
+        const std::string& value() const;
+        void seek(const std::string& target);
+        void seek_to_first();
+        void next();
+
+    private:
+        friend class KVStore;
+
+        struct Impl;
+        explicit StreamingIterator(std::unique_ptr<Impl> impl);
+
+        std::unique_ptr<Impl> impl_;
+    };
+
     Snapshot snapshot() const;
 
     Iterator new_iterator() const;
     Iterator new_iterator(const Snapshot& snapshot) const;
+
+    StreamingIterator new_streaming_iterator() const;
+    StreamingIterator new_streaming_iterator(const Snapshot& snapshot) const;
+
+    // Inclusive begin, exclusive end. Results are ordered by user key.
+    std::vector<Entry> scan(
+        const std::string& begin,
+        const std::string& end,
+        std::size_t limit = 1000) const;
+
+    std::vector<Entry> scan(
+        const std::string& begin,
+        const std::string& end,
+        std::size_t limit,
+        const Snapshot& snapshot) const;
 
     std::optional<std::string> get(
         const std::string& key,
@@ -252,7 +296,7 @@ class KVStore{
     struct Level0Table {
         std::uint64_t generation;
         std::string path;
-        std::unique_ptr<SSTable> table;
+        std::shared_ptr<SSTable> table;
     };
 
     // Stored from oldest to newest. Reads walk this vector backwards.

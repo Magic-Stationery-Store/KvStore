@@ -15,16 +15,53 @@
 
 namespace {
 
-constexpr std::size_t kInternalSuffixSize = 9;
+constexpr std::size_t kInternalSuffixSize = 11;
+constexpr char kEscapedNul = static_cast<char>(0xFF);
+
+std::string escape_user_key(const std::string& user_key) {
+    std::string escaped;
+    escaped.reserve(user_key.size());
+    for (const char character : user_key) {
+        if (character == '\0') {
+            escaped.push_back('\0');
+            escaped.push_back(kEscapedNul);
+        } else {
+            escaped.push_back(character);
+        }
+    }
+    return escaped;
+}
+
+bool unescape_user_key(
+    const std::string& escaped,
+    std::string& user_key
+) {
+    user_key.clear();
+    user_key.reserve(escaped.size());
+    for (std::size_t i = 0; i < escaped.size(); ++i) {
+        if (escaped[i] == '\0') {
+            if (i + 1 >= escaped.size()
+                || escaped[i + 1] != kEscapedNul) {
+                return false;
+            }
+            user_key.push_back('\0');
+            ++i;
+        } else {
+            user_key.push_back(escaped[i]);
+        }
+    }
+    return true;
+}
 
 std::string encode_internal_key(
     const std::string& user_key,
     std::uint64_t sequence,
     bool tombstone
 ) {
-    std::string internal;
-    internal.reserve(user_key.size() + kInternalSuffixSize);
-    internal.append(user_key);
+    std::string internal = escape_user_key(user_key);
+    internal.reserve(internal.size() + kInternalSuffixSize);
+    internal.push_back('\0');
+    internal.push_back('\0');
 
     const std::uint64_t inverted = ~sequence;
     for (int shift = 56; shift >= 0; shift -= 8) {
@@ -45,24 +82,29 @@ bool decode_internal_key(
         return false;
     }
     const std::size_t offset = internal.size() - kInternalSuffixSize;
+    if (internal[offset] != '\0' || internal[offset + 1] != '\0') {
+        return false;
+    }
+
     std::uint64_t inverted = 0;
     for (std::size_t i = 0; i < 8; ++i) {
         inverted = (inverted << 8)
-            | static_cast<unsigned char>(internal[offset + i]);
+            | static_cast<unsigned char>(internal[offset + 2 + i]);
     }
-    user_key = internal.substr(0, offset);
     sequence = ~inverted;
     tombstone = internal.back() != '\0';
-    return true;
+    return unescape_user_key(
+        internal.substr(0, offset), user_key);
 }
 
 std::string encode_seek_key(
     const std::string& user_key,
     std::uint64_t sequence
 ) {
-    std::string seek;
-    seek.reserve(user_key.size() + kInternalSuffixSize);
-    seek.append(user_key);
+    std::string seek = escape_user_key(user_key);
+    seek.reserve(seek.size() + kInternalSuffixSize);
+    seek.push_back('\0');
+    seek.push_back('\0');
 
     const std::uint64_t inverted = ~sequence;
     for (int shift = 56; shift >= 0; shift -= 8) {
@@ -840,7 +882,7 @@ void KVStore::initialize_manifest() {
         replay();
         for (const auto generation : manifest_.level0) {
             const std::string path = sstable_path_for_generation(generation);
-            auto table = std::make_unique<SSTable>(path);
+            auto table = std::make_shared<SSTable>(path);
             for (const auto& [key, value] : table->read_all()) {
                 (void)value;
                 observe_internal_key(key);
@@ -956,7 +998,7 @@ void KVStore::load_sstables() {
 
     std::sort(files.begin(), files.end());
     for (const auto& [generation, path] : files) {
-        auto table = std::make_unique<SSTable>(path);
+        auto table = std::make_shared<SSTable>(path);
         for (const auto& [key, value] : table->read_all()) {
             (void)value;
             observe_internal_key(key);
@@ -1073,7 +1115,7 @@ void KVStore::recover_immutable_wals() {
             // from the immutable WAL, even if its bytes look valid.
             std::filesystem::remove(table_path);
             SSTable::build(table_path, recovered);
-            auto table = std::make_unique<SSTable>(table_path);
+            auto table = std::make_shared<SSTable>(table_path);
             auto state = manifest_;
             state.level0.push_back(generation);
             std::sort(state.level0.begin(), state.level0.end());
@@ -1221,7 +1263,7 @@ void KVStore::background_flush_loop() {
             const std::string table_path =
                 sstable_path_for_generation(generation);
             SSTable::build(table_path, *snapshot);
-            auto table = std::make_unique<SSTable>(table_path);
+            auto table = std::make_shared<SSTable>(table_path);
 
             {
                 const std::lock_guard<std::mutex> guard(mutex_);
@@ -1938,4 +1980,447 @@ KVStore::snapshot_locked(std::uint64_t sequence) const {
         }
     }
     return std::make_shared<const std::vector<Entry>>(std::move(result));
+}
+
+struct KVStore::StreamingIterator::Impl {
+    struct Source {
+        virtual ~Source() = default;
+        virtual bool valid() const = 0;
+        virtual const std::string& key() const = 0;
+        virtual const std::optional<std::string>& value() const = 0;
+        virtual void seek(const std::string& target) = 0;
+        virtual void next() = 0;
+    };
+
+    struct MapSource final : Source {
+        explicit MapSource(
+            std::shared_ptr<const std::map<
+                std::string,
+                std::optional<std::string>>> data
+        ) : data_(std::move(data)), iterator_(data_->begin()) {}
+
+        bool valid() const override {
+            return iterator_ != data_->end();
+        }
+        const std::string& key() const override {
+            return iterator_->first;
+        }
+        const std::optional<std::string>& value() const override {
+            return iterator_->second;
+        }
+        void seek(const std::string& target) override {
+            iterator_ = data_->lower_bound(target);
+        }
+        void next() override {
+            if (iterator_ != data_->end()) {
+                ++iterator_;
+            }
+        }
+
+        std::shared_ptr<const std::map<
+            std::string,
+            std::optional<std::string>>> data_;
+        std::map<
+            std::string,
+            std::optional<std::string>>::const_iterator iterator_;
+    };
+
+    struct TableSource final : Source {
+        explicit TableSource(std::shared_ptr<SSTable> table)
+            : table_(std::move(table)),
+              index_(table_->index_snapshot()),
+              file_(std::make_shared<std::ifstream>(
+                  table_->path(), std::ios::binary)) {
+            if (!file_->is_open()) {
+                throw std::runtime_error(
+                    "Cannot open SSTable for streaming iterator");
+            }
+            load();
+        }
+
+        bool valid() const override { return valid_; }
+        const std::string& key() const override { return key_; }
+        const std::optional<std::string>& value() const override {
+            return value_;
+        }
+
+        void seek(const std::string& target) override {
+            const auto found = std::lower_bound(
+                index_.begin(),
+                index_.end(),
+                target,
+                [](const SSTable::EntryRef& entry,
+                   const std::string& wanted) {
+                    return entry.key < wanted;
+                });
+            position_ = static_cast<std::size_t>(
+                found - index_.begin());
+            load();
+        }
+
+        void next() override {
+            if (position_ < index_.size()) {
+                ++position_;
+            }
+            load();
+        }
+
+        void load() {
+            if (position_ >= index_.size()) {
+                valid_ = false;
+                value_.reset();
+                return;
+            }
+            valid_ = true;
+            key_ = index_[position_].key;
+            if (index_[position_].tombstone) {
+                value_.reset();
+                return;
+            }
+
+            file_->clear();
+            file_->seekg(
+                static_cast<std::streamoff>(
+                    index_[position_].value_offset),
+                std::ios::beg);
+            if (!*file_) {
+                throw std::runtime_error(
+                    "Cannot seek in SSTable for streaming iterator");
+            }
+            std::string value(index_[position_].value_size, '\0');
+            if (index_[position_].value_size != 0) {
+                file_->read(
+                    value.data(),
+                    static_cast<std::streamsize>(
+                        index_[position_].value_size));
+                if (!*file_) {
+                    throw std::runtime_error(
+                        "Cannot read SSTable for streaming iterator");
+                }
+            }
+            value_ = std::move(value);
+        }
+
+        std::shared_ptr<SSTable> table_;
+        std::vector<SSTable::EntryRef> index_;
+        std::shared_ptr<std::ifstream> file_;
+        std::size_t position_ = 0;
+        bool valid_ = false;
+        std::string key_;
+        std::optional<std::string> value_;
+    };
+
+    struct BaseRef {
+        std::uint64_t value_offset = 0;
+        std::uint32_t value_size = 0;
+        bool tombstone = false;
+    };
+
+    struct BaseSource final : Source {
+        BaseSource(
+            std::map<std::string, BaseRef> index,
+            const std::string& path
+        ) : index_(std::move(index)),
+            iterator_(index_.begin()),
+            file_(std::make_shared<std::ifstream>(
+                path, std::ios::binary)) {
+            if (!file_->is_open()) {
+                throw std::runtime_error(
+                    "Cannot open BASE for streaming iterator");
+            }
+            load();
+        }
+
+        bool valid() const override { return iterator_ != index_.end(); }
+        const std::string& key() const override { return key_; }
+        const std::optional<std::string>& value() const override {
+            return value_;
+        }
+
+        void seek(const std::string& target) override {
+            iterator_ = index_.lower_bound(target);
+            load();
+        }
+
+        void next() override {
+            if (iterator_ != index_.end()) {
+                ++iterator_;
+            }
+            load();
+        }
+
+        void load() {
+            if (iterator_ == index_.end()) {
+                key_.clear();
+                value_.reset();
+                return;
+            }
+            key_ = iterator_->first;
+            if (iterator_->second.tombstone) {
+                value_.reset();
+                return;
+            }
+
+            file_->clear();
+            file_->seekg(
+                static_cast<std::streamoff>(
+                    iterator_->second.value_offset),
+                std::ios::beg);
+            if (!*file_) {
+                throw std::runtime_error(
+                    "Cannot seek in BASE for streaming iterator");
+            }
+            std::string value(iterator_->second.value_size, '\0');
+            if (iterator_->second.value_size != 0) {
+                file_->read(
+                    value.data(),
+                    static_cast<std::streamsize>(
+                        iterator_->second.value_size));
+                if (!*file_) {
+                    throw std::runtime_error(
+                        "Cannot read BASE for streaming iterator");
+                }
+            }
+            value_ = std::move(value);
+        }
+
+        std::map<std::string, BaseRef> index_;
+        std::map<std::string, BaseRef>::const_iterator iterator_;
+        std::shared_ptr<std::ifstream> file_;
+        std::string key_;
+        std::optional<std::string> value_;
+    };
+
+    Impl(
+        std::uint64_t snapshot,
+        std::vector<std::unique_ptr<Source>> sources
+    ) : snapshot_(snapshot), sources_(std::move(sources)) {}
+
+    void skip_user(const std::string& user) {
+        for (auto& source : sources_) {
+            while (source->valid()) {
+                std::string current_user;
+                std::uint64_t sequence = 0;
+                bool tombstone = false;
+                if (!decode_internal_key(
+                        source->key(),
+                        current_user,
+                        sequence,
+                        tombstone)
+                    || current_user != user) {
+                    break;
+                }
+                source->next();
+            }
+        }
+    }
+
+    bool find_visible() {
+        while (true) {
+            std::size_t best = sources_.size();
+            for (std::size_t i = 0; i < sources_.size(); ++i) {
+                if (!sources_[i]->valid()) {
+                    continue;
+                }
+                if (best == sources_.size()
+                    || sources_[i]->key() < sources_[best]->key()) {
+                    best = i;
+                }
+            }
+            if (best == sources_.size()) {
+                valid_ = false;
+                return false;
+            }
+
+            std::string user;
+            std::uint64_t sequence = 0;
+            bool tombstone = false;
+            if (!decode_internal_key(
+                    sources_[best]->key(), user, sequence, tombstone)) {
+                sources_[best]->next();
+                continue;
+            }
+            if (sequence > snapshot_) {
+                sources_[best]->next();
+                continue;
+            }
+
+            current_key_ = user;
+            if (!sources_[best]->value().has_value()) {
+                skip_user(user);
+                continue;
+            }
+
+            current_value_ = sources_[best]->value();
+            valid_ = true;
+            return true;
+        }
+    }
+
+    void seek(const std::string& user) {
+        // Use the plain user key as the lower bound. Encoding the snapshot
+        // into the seek key would sort after longer keys such as "aa" when
+        // seeking "a"; find_visible() filters versions newer than the snapshot.
+        for (auto& source : sources_) {
+            source->seek(user);
+        }
+        valid_ = false;
+        find_visible();
+    }
+
+    void next() {
+        if (!valid_) {
+            return;
+        }
+        const std::string user = current_key_;
+        skip_user(user);
+        find_visible();
+    }
+
+    std::uint64_t snapshot_ = 0;
+    std::vector<std::unique_ptr<Source>> sources_;
+    bool valid_ = false;
+    std::string current_key_;
+    std::optional<std::string> current_value_;
+};
+
+KVStore::StreamingIterator::StreamingIterator() noexcept = default;
+KVStore::StreamingIterator::~StreamingIterator() = default;
+
+KVStore::StreamingIterator::StreamingIterator(
+    std::unique_ptr<Impl> impl
+) : impl_(std::move(impl)) {}
+
+KVStore::StreamingIterator::StreamingIterator(
+    StreamingIterator&&
+) noexcept = default;
+
+KVStore::StreamingIterator& KVStore::StreamingIterator::operator=(
+    StreamingIterator&&
+) noexcept = default;
+
+bool KVStore::StreamingIterator::valid() const noexcept {
+    return impl_ != nullptr && impl_->valid_;
+}
+
+const std::string& KVStore::StreamingIterator::key() const {
+    if (!valid()) {
+        throw std::out_of_range(
+            "StreamingIterator::key on invalid iterator");
+    }
+    return impl_->current_key_;
+}
+
+const std::string& KVStore::StreamingIterator::value() const {
+    if (!valid() || !impl_->current_value_.has_value()) {
+        throw std::out_of_range(
+            "StreamingIterator::value on invalid iterator");
+    }
+    return *impl_->current_value_;
+}
+
+void KVStore::StreamingIterator::seek(const std::string& target) {
+    if (impl_) {
+        impl_->seek(target);
+    }
+}
+
+void KVStore::StreamingIterator::seek_to_first() {
+    seek("");
+}
+
+void KVStore::StreamingIterator::next() {
+    if (impl_) {
+        impl_->next();
+    }
+}
+
+KVStore::StreamingIterator KVStore::new_streaming_iterator() const {
+    return new_streaming_iterator(snapshot());
+}
+
+KVStore::StreamingIterator KVStore::new_streaming_iterator(
+    const Snapshot& snapshot
+) const {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    rethrow_background_error_locked();
+
+    std::vector<std::unique_ptr<StreamingIterator::Impl::Source>> sources;
+
+    if (log_path_.empty()) {
+        auto data = std::make_shared<std::map<
+            std::string,
+            std::optional<std::string>>>();
+        for (const auto& [key, value] : memory_data_) {
+            data->emplace(
+                encode_internal_key(key, last_sequence_, false),
+                value);
+        }
+        sources.push_back(
+            std::make_unique<StreamingIterator::Impl::MapSource>(data));
+    } else {
+        auto active = std::make_shared<std::map<
+            std::string,
+            std::optional<std::string>>>(memtable_);
+        sources.push_back(
+            std::make_unique<StreamingIterator::Impl::MapSource>(active));
+
+        if (immutable_memtable_) {
+            sources.push_back(std::make_unique<
+                StreamingIterator::Impl::MapSource>(immutable_memtable_));
+        }
+
+        for (auto table = level0_tables_.rbegin();
+             table != level0_tables_.rend();
+             ++table) {
+            sources.push_back(std::make_unique<
+                StreamingIterator::Impl::TableSource>(table->table));
+        }
+
+        if (!index_.empty()) {
+            std::map<std::string, StreamingIterator::Impl::BaseRef> index;
+            for (const auto& [key, entry] : index_) {
+                index.emplace(key, StreamingIterator::Impl::BaseRef{
+                    entry.value_offset,
+                    entry.value_size,
+                    entry.tombstone
+                });
+            }
+            sources.push_back(std::make_unique<
+                StreamingIterator::Impl::BaseSource>(
+                    std::move(index), base_path_));
+        }
+    }
+
+    return StreamingIterator(std::make_unique<StreamingIterator::Impl>(
+        snapshot.sequence(), std::move(sources)));
+}
+
+std::vector<KVStore::Entry> KVStore::scan(
+    const std::string& begin,
+    const std::string& end,
+    std::size_t limit
+) const {
+    return scan(begin, end, limit, snapshot());
+}
+
+std::vector<KVStore::Entry> KVStore::scan(
+    const std::string& begin,
+    const std::string& end,
+    std::size_t limit,
+    const Snapshot& snapshot
+) const {
+    std::vector<Entry> result;
+    if (limit == 0) {
+        return result;
+    }
+
+    StreamingIterator iterator = new_streaming_iterator(snapshot);
+    iterator.seek(begin);
+    while (iterator.valid() && iterator.key() < end
+           && result.size() < limit) {
+        result.emplace_back(iterator.key(), iterator.value());
+        iterator.next();
+    }
+    return result;
 }

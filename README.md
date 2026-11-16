@@ -24,14 +24,17 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   同一个数据库被多个进程打开。
 - **可观测性**：`inspect_entries` / `explain_key` / `inspect_tables` 只读接口，
   Qt 控制台直接展示层次数据和查询路径（含被遮蔽的旧值）。
-- **MVCC 快照读**：内部键为 `user_key + 反序 sequence(8B) + type(1B)`；
+- **MVCC 快照读**：内部键为 `转义后的 user_key + 0x00 0x00 + 反序 sequence(8B) + type(1B)`；
   `snapshot()` / `get(key, snapshot)` / `new_iterator(snapshot)` 可读取历史版本，
   墓碑在快照中同样可见。Compact 按最老活跃快照回收旧版本：保留快照可见的版本，
   无快照时每个 key 只保留最新版本。
 - **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
   sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
 - **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
-  提供 `Seek/Next` 并跳过墓碑；当前是快照物化实现，下一步替换为流式迭代器。
+  提供 `Seek/Next` 并跳过墓碑；物化一份有序快照，适合小数据量和调试。
+- **流式 MergingIterator**：`new_streaming_iterator()` 每层一个游标，按内部键归并，
+  value 按需从 SSTable/BASE 读取；`scan(begin, end, limit)` 提供范围扫描
+  （begin 包含，end 不包含），不复制整库数据。
 - **跨平台**：核心逻辑 POSIX/Windows 双实现（`src/platform.cpp`），
   Windows 上用 `CreateFile/FlushFileBuffers/MoveFileEx` 替代 `fsync/rename/flock`。
 
@@ -41,6 +44,9 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
 auto snapshot = store.snapshot();
 store.get("key", snapshot);          // read at a stable sequence
 auto iterator = store.new_iterator(snapshot);
+
+auto streaming = store.new_streaming_iterator(snapshot);
+auto rows = store.scan("a", "z", 100, snapshot);  // [a, z)
 
 KVStore::WriteBatch batch;
 batch.put("a", "1");
@@ -92,9 +98,10 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 18 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+当前 19 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
 并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
-WriteBatch 原子提交、快照感知 GC，以及可视化控制台使用的只读观测接口。
+WriteBatch 原子提交、快照感知 GC、流式迭代器与范围扫描，以及可视化控制台
+使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -120,7 +127,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 18/18 通过；`-DKVSTORE_SANITIZER=thread` 构建下 17 项通过
+实测 ASan/UBSan 下 19/19 通过；`-DKVSTORE_SANITIZER=thread` 构建下 18 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -154,38 +161,38 @@ TMPDIR=/home/you/kvstore-bench ./build-bench/kvstore_bench
 
 | 指标 | 数值 |
 | --- | --- |
-| Put 吞吐（不含 fsync） | 33.1 万 ops/s |
-| 一次 sync | 12.1 ms |
-| Get（MemTable） | 200 万 ops/s，P50 0.3 us / P99 0.8 us |
-| Get（L0） | 39.8 万 ops/s，P50 2.1 us / P99 5.7 us |
-| Flush | 122.1 ms |
-| Compact | 159.2 ms |
-| Get（BASE） | 38.5 万 ops/s，P50 2.2 us / P99 3.8 us |
+| Put 吞吐（不含 fsync） | 32.1 万 ops/s |
+| 一次 sync | 10.0 ms |
+| Get（MemTable） | 170 万 ops/s，P50 0.4 us / P99 1.0 us |
+| Get（L0） | 36.1 万 ops/s，P50 2.3 us / P99 7.3 us |
+| Flush | 123.5 ms |
+| Compact | 150.2 ms |
+| Get（BASE） | 36.9 万 ops/s，P50 2.3 us / P99 4.9 us |
 
 value 大小对吞吐的影响：
 
 | value | 记录数 | Put ops/s | Get ops/s | Get P99 |
 | --- | --- | --- | --- | --- |
-| 64 B | 20000 | 34.7 万 | 230 万 | 0.7 us |
-| 1 KiB | 20000 | 12.8 万 | 164 万 | 1.1 us |
-| 4 KiB | 10000 | 4.2 万 | 127 万 | 1.4 us |
+| 64 B | 20000 | 34.8 万 | 206 万 | 0.9 us |
+| 1 KiB | 20000 | 13.1 万 | 146 万 | 1.3 us |
+| 4 KiB | 10000 | 4.26 万 | 121 万 | 1.3 us |
 
 L0 读放大（`missing` 需要扫完所有 L0；`victim` 命中最早的表）：
 
 | L0 表数 | missing P50 | victim P50 |
 | --- | --- | --- |
-| 1 | 1.45 us | 1.47 us |
-| 10 | 1.72 us | 1.63 us |
-| 25 | 2.29 us | 2.42 us |
-| 50 | 12.68 us | 3.40 us |
+| 1 | 1.42 us | 1.40 us |
+| 10 | 3.52 us | 1.76 us |
+| 25 | 2.17 us | 2.05 us |
+| 50 | 12.46 us | 2.92 us |
 
 说明：
 
 - Put 只写 WAL 到页缓存，不含 `fsync`；`sync` 是 5 万条写后的一次 fsync。
-- 每个 key 额外带 9 B 的 MVCC 内部后缀，所以 BASE 约 6640 KiB；5 万个 key 都是唯一的，
+- 每个 key 额外带 11 B 的 MVCC 内部后缀，所以 BASE 约 6738 KiB；5 万个 key 都是唯一的，
   没有旧版本可回收，因此 Compact 前后大小不变；覆盖/删除场景由 `kvstore_compaction_tests` 覆盖。
-- L0 表数到 50 时 `missing` P50 从 1.45 us 升到 12.68 us，体现读放大；`victim` 命中
-  最早的表，稳定在 1.5–3.4 us。
+- L0 表数到 50 时 `missing` P50 从 1.42 us 升到 12.46 us，体现读放大；`victim` 命中
+  最早的表，稳定在 1.4–2.9 us。
 - Put/Get 已包含内部键编码和快照版本选择；数字是本机实测，换机器会变。
 
 ## Qt 可视化控制台
@@ -235,7 +242,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  18 个端到端测试
+tests/                  19 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -252,7 +259,7 @@ docs/                   截图与文档
 - [x] MVCC 快照读（get / iterator）
 - [x] WriteBatch 原子提交
 - [x] 快照感知 GC（按最老活跃快照回收旧版本）
-- [ ] 流式迭代器 / 范围扫描 API
+- [x] 流式 MergingIterator / 范围扫描 API
 - [ ] WAL 组提交、无锁读路径
 
 ## License

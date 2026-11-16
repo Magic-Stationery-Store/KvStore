@@ -262,6 +262,24 @@ SSTableSeekResult SSTable::seek(
     return result;
 }
 
+std::vector<SSTable::EntryRef> SSTable::index_snapshot() const {
+    std::vector<EntryRef> result;
+    result.reserve(index_.size());
+    for (const auto& entry : index_) {
+        result.push_back(EntryRef{
+            entry.key,
+            entry.value_offset,
+            entry.value_size,
+            entry.tombstone
+        });
+    }
+    return result;
+}
+
+const std::string& SSTable::path() const noexcept {
+    return path_;
+}
+
 SSTable::Entries SSTable::read_all() const {
     Entries entries;
     std::ifstream input(path_, std::ios::binary);
