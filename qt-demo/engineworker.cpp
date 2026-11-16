@@ -52,6 +52,18 @@ QString roleFor(const QString& name, const QString& base) {
         && name.endsWith(QStringLiteral(".sst"))) {
         return QStringLiteral("L0 SSTable");
     }
+    if (name.startsWith(base + QStringLiteral(".L1."))
+        && name.endsWith(QStringLiteral(".sst"))) {
+        return QStringLiteral("L1 SSTable");
+    }
+    if (name.startsWith(base + QStringLiteral(".L2."))
+        && name.endsWith(QStringLiteral(".sst"))) {
+        return QStringLiteral("L2 SSTable");
+    }
+    if (name.startsWith(base + QStringLiteral(".L3."))
+        && name.endsWith(QStringLiteral(".sst"))) {
+        return QStringLiteral("L3 SSTable");
+    }
     if (name.startsWith(base + QStringLiteral(".base."))
         && name.endsWith(QStringLiteral(".log"))) {
         return QStringLiteral("BASE 数据文件");
@@ -100,26 +112,65 @@ void EngineWorker::openDatabase(const QString& path, int limit, bool seedDemo) {
 void EngineWorker::seedDemoData() {
     QElapsedTimer timer;
     timer.start();
+    store_->set_level0_compaction_trigger(0);
 
-    // 1. Build a BASE file with three keys.
+    // 1. BASE: a / b / c.
     store_->put("a", "base-a");
     store_->put("b", "base-b");
     store_->put("c", "base-c");
     store_->flush();
     store_->compact();
 
-    // 2. Create one L0 table that shadows the BASE and deletes "b".
+    // 2. L1: a=new, b=tombstone, d=four.
     store_->put("a", "new");
     store_->remove("b");
     store_->put("d", "four");
     store_->flush();
+    store_->compact_levels();
 
-    // 3. Leave one entry in the Active MemTable.
+    // Merge a second batch into L1.
+    store_->put("f", "six");
+    store_->put("g", "seven");
+    store_->put("h", "eight");
+    store_->flush();
+    store_->compact_levels();
+
+    // 3. Move the first L1 into L2, then L2 into L3.
+    store_->set_level1_to_level2_trigger_bytes(1);
+    store_->compact_l1_to_l2();
+    store_->set_level2_to_level3_trigger_bytes(1);
+    store_->compact_l2_to_l3();
+    store_->set_level2_to_level3_trigger_bytes(0);
+
+    // 4. Rebuild L2 from a new L1, then leave a newer L1 above it.
+    store_->put("i", "nine");
+    store_->put("j", "ten");
+    store_->put("k", "eleven");
+    store_->flush();
+    store_->compact_levels();
+
+    store_->set_level1_to_level2_trigger_bytes(0);
+    store_->put("l", "twelve");
+    store_->put("m", "thirteen");
+    store_->put("n", "fourteen");
+    store_->flush();
+    store_->compact_levels();
+
+    // 5. L0 + Active, so the demo shows every layer at once.
+    store_->put("o", "fifteen");
+    store_->put("p", "sixteen");
+    store_->put("q", "seventeen");
+    store_->flush();
     store_->put("e", "five");
 
-    emit logMessage(QStringLiteral("[%1] 已写入演示数据（%2 ms）：BASE + 1 张 L0 + Active")
-                        .arg(QTime::currentTime().toString("HH:mm:ss"))
-                        .arg(timer.elapsed()));
+    // Warm the block cache so the overview shows hit/miss behavior.
+    (void)store_->get("b");
+
+    emit logMessage(
+        QStringLiteral(
+            "[%1] 已写入演示数据（%2 ms）：BASE + L3 + L2 + L1 + L0 + Active")
+            .arg(QTime::currentTime().toString("HH:mm:ss"))
+            .arg(timer.elapsed()));
 }
 
 void EngineWorker::refresh() {
@@ -136,7 +187,7 @@ void EngineWorker::explain(const QString& key) {
             throw std::runtime_error("数据库尚未打开");
         }
 
-        DemoSnapshot snapshot = buildSnapshot();
+        DemoSnapshot snapshot;
         const auto probes = store_->explain_key(key.toStdString());
 
         QVector<DemoRow> probeRows;
@@ -185,9 +236,16 @@ void EngineWorker::explain(const QString& key) {
             result = QStringLiteral("不存在：所有层均未命中");
         }
 
+        snapshot = buildSnapshot();
         snapshot.queryKey = key;
         snapshot.queryResult = result;
         snapshot.probeRows = probeRows;
+        const auto cache = store_->block_cache_stats();
+        snapshot.cache.hits = cache.hits;
+        snapshot.cache.misses = cache.misses;
+        snapshot.cache.evictions = cache.evictions;
+        snapshot.cache.bytes = static_cast<qint64>(cache.bytes);
+        snapshot.cache.entries = static_cast<int>(cache.entries);
         emit snapshotReady(snapshot);
     } catch (const std::exception& error) {
         emit failed(QString::fromUtf8(error.what()));
@@ -282,6 +340,57 @@ void EngineWorker::compactNow() {
     }
 }
 
+void EngineWorker::compactLevels() {
+    try {
+        if (!store_) {
+            throw std::runtime_error("数据库尚未打开");
+        }
+        QElapsedTimer timer;
+        timer.start();
+        store_->compact_levels();
+        emit logMessage(QStringLiteral("[%1] L0→L1 完成（%2 ms）")
+                            .arg(QTime::currentTime().toString("HH:mm:ss"))
+                            .arg(timer.elapsed()));
+        publish();
+    } catch (const std::exception& error) {
+        emit failed(QString::fromUtf8(error.what()));
+    }
+}
+
+void EngineWorker::compactL1ToL2() {
+    try {
+        if (!store_) {
+            throw std::runtime_error("数据库尚未打开");
+        }
+        QElapsedTimer timer;
+        timer.start();
+        store_->compact_l1_to_l2();
+        emit logMessage(QStringLiteral("[%1] L1→L2 完成（%2 ms）")
+                            .arg(QTime::currentTime().toString("HH:mm:ss"))
+                            .arg(timer.elapsed()));
+        publish();
+    } catch (const std::exception& error) {
+        emit failed(QString::fromUtf8(error.what()));
+    }
+}
+
+void EngineWorker::compactL2ToL3() {
+    try {
+        if (!store_) {
+            throw std::runtime_error("数据库尚未打开");
+        }
+        QElapsedTimer timer;
+        timer.start();
+        store_->compact_l2_to_l3();
+        emit logMessage(QStringLiteral("[%1] L2→L3 完成（%2 ms）")
+                            .arg(QTime::currentTime().toString("HH:mm:ss"))
+                            .arg(timer.elapsed()));
+        publish();
+    } catch (const std::exception& error) {
+        emit failed(QString::fromUtf8(error.what()));
+    }
+}
+
 DemoSnapshot EngineWorker::buildSnapshot() const {
     DemoSnapshot snapshot;
     snapshot.dbPath = dbPath_;
@@ -303,23 +412,77 @@ DemoSnapshot EngineWorker::buildSnapshot() const {
     }
 
     const auto tables = store_->inspect_tables();
-    int l0Tables = 0;
-    std::size_t baseEntries = 0;
-    for (const auto& table : tables) {
-        if (table.kind == "L0") {
-            ++l0Tables;
-        } else if (table.kind == "BASE") {
-            baseEntries = table.entries;
-        }
+    for (const auto* kind : {"L0", "L1", "L2", "L3", "BASE"}) {
+        DemoLayerStat layer;
+        layer.kind = QString::fromLatin1(kind);
+        snapshot.layers.push_back(layer);
     }
 
+    const auto layerFor = [&snapshot](const QString& kind) {
+        for (auto& layer : snapshot.layers) {
+            if (layer.kind == kind) {
+                return &layer;
+            }
+        }
+        return static_cast<DemoLayerStat*>(nullptr);
+    };
+
+    for (const auto& table : tables) {
+        auto* layer = layerFor(QString::fromStdString(table.kind));
+        if (layer == nullptr) {
+            continue;
+        }
+        ++layer->tables;
+        layer->entries += static_cast<qint64>(table.entries);
+        const qint64 bytes =
+            QFileInfo(fromNativePath(table.path)).size();
+        layer->bytes += bytes;
+        snapshot.totalBytes += bytes;
+    }
+
+    const auto cache = store_->block_cache_stats();
+    snapshot.cache.hits = cache.hits;
+    snapshot.cache.misses = cache.misses;
+    snapshot.cache.evictions = cache.evictions;
+    snapshot.cache.bytes = static_cast<qint64>(cache.bytes);
+    snapshot.cache.entries = static_cast<int>(cache.entries);
+
+    const auto countFor = [&snapshot](const QString& kind) {
+        for (const auto& layer : snapshot.layers) {
+            if (layer.kind == kind) {
+                return layer.tables;
+            }
+        }
+        return 0;
+    };
+    const auto baseEntries = [&snapshot] {
+        for (const auto& layer : snapshot.layers) {
+            if (layer.kind == QStringLiteral("BASE")) {
+                return layer.entries;
+            }
+        }
+        return qint64{0};
+    }();
+
+    const double hitRate =
+        cache.hits + cache.misses == 0
+            ? 0.0
+            : 100.0 * static_cast<double>(cache.hits)
+                / static_cast<double>(cache.hits + cache.misses);
+
     snapshot.summary =
-        QStringLiteral("MemTable %1 项  ·  Immutable %2  ·  L0 %3 张  ·  BASE %4 项")
+        QStringLiteral(
+            "MemTable %1 项 · Immutable %2 · L0 %3 · L1 %4 · L2 %5 · L3 %6 "
+            "· BASE %7 项 · Cache %8%")
             .arg(store_->memtable_entry_count())
             .arg(store_->has_immutable_memtable() ? QStringLiteral("有")
                                                   : QStringLiteral("无"))
-            .arg(l0Tables)
-            .arg(baseEntries);
+            .arg(countFor(QStringLiteral("L0")))
+            .arg(countFor(QStringLiteral("L1")))
+            .arg(countFor(QStringLiteral("L2")))
+            .arg(countFor(QStringLiteral("L3")))
+            .arg(baseEntries)
+            .arg(hitRate, 0, 'f', 1);
 
     if (!dbPath_.isEmpty()) {
         const QFileInfo database(dbPath_);

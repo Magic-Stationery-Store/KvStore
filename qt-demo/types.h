@@ -24,6 +24,21 @@ struct DemoFileRow {
 
 Q_DECLARE_METATYPE(DemoFileRow)
 
+struct DemoLayerStat {
+    QString kind;
+    int tables = 0;
+    qint64 bytes = 0;
+    qint64 entries = 0;
+};
+
+struct DemoCacheStat {
+    quint64 hits = 0;
+    quint64 misses = 0;
+    quint64 evictions = 0;
+    qint64 bytes = 0;
+    int entries = 0;
+};
+
 // Everything the GUI needs after one engine operation.  It is produced on the
 // worker thread and copied to the GUI thread through a queued signal.
 struct DemoSnapshot {
@@ -35,6 +50,9 @@ struct DemoSnapshot {
     QVector<DemoRow> rows;
     QVector<DemoRow> probeRows;
     QVector<DemoFileRow> files;
+    QVector<DemoLayerStat> layers;
+    DemoCacheStat cache;
+    qint64 totalBytes = 0;
 };
 
 Q_DECLARE_METATYPE(DemoSnapshot)

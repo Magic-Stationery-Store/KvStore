@@ -4,8 +4,9 @@
 ![Qt](https://img.shields.io/badge/Qt-6.8%2B-green)
 
 一个 C++17 编写的嵌入式持久化键值存储，实现了 WAL、有序 MemTable、不可变
-MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compact。
-配套一个 Qt Widgets 可视化控制台，用来观察各层数据、MANIFEST 和单 key 的查询路径。
+MemTable、后台 Flush、L0–L3 SSTable、MANIFEST 版本提交、MVCC 快照与
+L0→L1→L2→L3 部分分层压缩。配套一个 Qt Widgets 可视化控制台，用来观察层级
+分布、Block Cache、MANIFEST 和单 key 的查询路径。
 
 ![Qt 控制台截图](docs/screenshot.png)
 

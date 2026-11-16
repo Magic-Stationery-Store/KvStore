@@ -4,6 +4,8 @@ add_executable(kvstore_qt_demo
     main.cpp
     mainwindow.cpp
     mainwindow.h
+    overviewwidget.cpp
+    overviewwidget.h
     engineworker.cpp
     engineworker.h
     tablemodel.cpp

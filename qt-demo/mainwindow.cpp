@@ -1,6 +1,7 @@
 #include "mainwindow.h"
-
+ 
 #include "engineworker.h"
+#include "overviewwidget.h"
 #include "tablemodel.h"
 
 #include <QAction>
@@ -12,13 +13,20 @@
 #include <QFontDatabase>
 #include <QGridLayout>
 #include <QGroupBox>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSettings>
+#include <QShortcut>
+#include <QSortFilterProxyModel>
 #include <QSplitter>
 #include <QStandardItemModel>
 #include <QStatusBar>
@@ -26,6 +34,7 @@
 #include <QTableView>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
@@ -47,9 +56,11 @@ QString formatSize(qint64 bytes) {
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildUi();
     connectEngine();
+    restoreUiState();
 }
 
 MainWindow::~MainWindow() {
+    saveUiState();
     engineThread_.quit();
     engineThread_.wait();
     delete worker_;
@@ -80,32 +91,98 @@ void MainWindow::buildUi() {
     connect(compactAction, &QAction::triggered,
             this, [this] { emit compactRequested(); });
 
+    auto* compactButton = new QToolButton(toolbar);
+    compactButton->setText(QStringLiteral("分层压缩"));
+    compactButton->setPopupMode(QToolButton::InstantPopup);
+    auto* compactMenu = new QMenu(compactButton);
+    auto* l0ToL1 = compactMenu->addAction(QStringLiteral("L0 → L1"));
+    auto* l1ToL2 = compactMenu->addAction(QStringLiteral("L1 → L2"));
+    auto* l2ToL3 = compactMenu->addAction(QStringLiteral("L2 → L3"));
+    connect(l0ToL1, &QAction::triggered, this, [this] {
+        emit compactLevelsRequested();
+    });
+    connect(l1ToL2, &QAction::triggered, this, [this] {
+        emit compactL1ToL2Requested();
+    });
+    connect(l2ToL3, &QAction::triggered, this, [this] {
+        emit compactL2ToL3Requested();
+    });
+    compactButton->setMenu(compactMenu);
+    toolbar->addWidget(compactButton);
+
     auto* splitter = new QSplitter(Qt::Horizontal, this);
+    splitter_ = splitter;
     auto* tabs = new QTabWidget(splitter);
+
+    overview_ = new LevelOverviewWidget(tabs);
+    tabs->addTab(overview_, QStringLiteral("概览"));
 
     // --- layer table ---------------------------------------------------
     auto* layersPage = new QWidget(tabs);
     auto* layersLayout = new QVBoxLayout(layersPage);
     auto* hint = new QLabel(
         QStringLiteral(
-            "读取顺序：Active → Immutable → L0（新→旧）→ BASE。"
+            "读取顺序：Active → Immutable → L0（新→旧）→ L1 → L2 → L3 → BASE。"
             "红色为墓碑，灰色表示该层未命中。"),
         layersPage);
     hint->setWordWrap(true);
     layersLayout->addWidget(hint);
 
+    auto* filterRow = new QHBoxLayout();
+    filterEdit_ = new QLineEdit(layersPage);
+    filterEdit_->setPlaceholderText(
+        QStringLiteral("过滤层 / key / 值（Ctrl+F）"));
+    filterEdit_->setClearButtonEnabled(true);
+    filterRow->addWidget(new QLabel(QStringLiteral("过滤"), layersPage));
+    filterRow->addWidget(filterEdit_, 1);
+    layersLayout->addLayout(filterRow);
+
     layerView_ = new QTableView(layersPage);
     layerModel_ = new LayerTableModel(false, this);
-    layerView_->setModel(layerModel_);
+    layerProxy_ = new QSortFilterProxyModel(this);
+    layerProxy_->setSourceModel(layerModel_);
+    layerProxy_->setFilterKeyColumn(-1);
+    layerProxy_->setFilterCaseSensitivity(Qt::CaseInsensitive);
+    layerProxy_->setDynamicSortFilter(true);
+    layerView_->setModel(layerProxy_);
+    layerView_->setSortingEnabled(true);
+    layerView_->sortByColumn(0, Qt::AscendingOrder);
     layerView_->setAlternatingRowColors(true);
     layerView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    layerView_->setSelectionMode(QAbstractItemView::SingleSelection);
     layerView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     layerView_->verticalHeader()->setVisible(false);
     layerView_->horizontalHeader()->setStretchLastSection(true);
     layerView_->horizontalHeader()->setSectionResizeMode(
         0, QHeaderView::ResizeToContents);
-    layersLayout->addWidget(layerView_);
+    layersLayout->addWidget(layerView_, 1);
+
+    auto* detailGroup = new QGroupBox(QStringLiteral("选中条目"), layersPage);
+    auto* detailLayout = new QVBoxLayout(detailGroup);
+    detailView_ = new QPlainTextEdit(detailGroup);
+    detailView_->setReadOnly(true);
+    detailView_->setMaximumBlockCount(20);
+    detailView_->setMaximumHeight(88);
+    detailView_->setPlaceholderText(
+        QStringLiteral("在表格中选择一行，查看完整 key / value"));
+    detailLayout->addWidget(detailView_);
+    layersLayout->addWidget(detailGroup);
     tabs->addTab(layersPage, QStringLiteral("层次数据"));
+
+    connect(filterEdit_, &QLineEdit::textChanged, this,
+            [this](const QString& text) {
+                layerProxy_->setFilterFixedString(text);
+            });
+    connect(layerView_->selectionModel(),
+            &QItemSelectionModel::currentRowChanged,
+            this, [this](const QModelIndex& current, const QModelIndex&) {
+                updateDetail(current);
+            });
+    auto* findShortcut = new QShortcut(QKeySequence::Find, this);
+    connect(findShortcut, &QShortcut::activated, this, [this] {
+        filterEdit_->setFocus();
+        filterEdit_->selectAll();
+    });
 
     // --- file list -----------------------------------------------------
     auto* filesPage = new QWidget(tabs);
@@ -239,6 +316,12 @@ void MainWindow::connectEngine() {
             worker_, &EngineWorker::flushNow);
     connect(this, &MainWindow::compactRequested,
             worker_, &EngineWorker::compactNow);
+    connect(this, &MainWindow::compactLevelsRequested,
+            worker_, &EngineWorker::compactLevels);
+    connect(this, &MainWindow::compactL1ToL2Requested,
+            worker_, &EngineWorker::compactL1ToL2);
+    connect(this, &MainWindow::compactL2ToL3Requested,
+            worker_, &EngineWorker::compactL2ToL3);
 
     connect(worker_, &EngineWorker::snapshotReady,
             this, &MainWindow::applySnapshot);
@@ -279,6 +362,10 @@ void MainWindow::openDemoDatabase() {
 void MainWindow::scheduleScreenshot(const QString& path) {
     screenshotPath_ = path;
     screenshotPending_ = true;
+    resize(1280, 820);
+    if (splitter_ != nullptr) {
+        splitter_->setSizes({900, 380});
+    }
 }
 
 void MainWindow::triggerScreenshotIfReady() {
@@ -299,6 +386,8 @@ void MainWindow::triggerScreenshotIfReady() {
 void MainWindow::applySnapshot(const DemoSnapshot& snapshot) {
     layerModel_->setRows(snapshot.rows);
     probeModel_->setRows(snapshot.probeRows);
+    overview_->setStats(
+        snapshot.layers, snapshot.cache, snapshot.totalBytes);
 
     if (!snapshot.queryResult.isEmpty()) {
         queryResult_->setText(snapshot.queryResult);
@@ -351,4 +440,65 @@ void MainWindow::showError(const QString& message) {
 
 void MainWindow::log(const QString& message) {
     logView_->appendPlainText(message);
+}
+
+void MainWindow::restoreUiState() {
+    QSettings settings;
+    const bool offscreen =
+        QGuiApplication::platformName() == QStringLiteral("offscreen");
+    if (!offscreen) {
+        restoreGeometry(
+            settings.value(QStringLiteral("ui/geometry")).toByteArray());
+        restoreState(
+            settings.value(QStringLiteral("ui/windowState")).toByteArray());
+        if (splitter_ != nullptr) {
+            splitter_->restoreState(
+                settings.value(QStringLiteral("ui/splitter")).toByteArray());
+        }
+    }
+    if (filterEdit_ != nullptr) {
+        filterEdit_->setText(
+            settings.value(QStringLiteral("ui/filter")).toString());
+    }
+}
+
+void MainWindow::saveUiState() {
+    QSettings settings;
+    settings.setValue(QStringLiteral("ui/geometry"), saveGeometry());
+    settings.setValue(QStringLiteral("ui/windowState"), saveState());
+    if (splitter_ != nullptr) {
+        settings.setValue(
+            QStringLiteral("ui/splitter"), splitter_->saveState());
+    }
+    if (filterEdit_ != nullptr) {
+        settings.setValue(
+            QStringLiteral("ui/filter"), filterEdit_->text());
+    }
+}
+
+void MainWindow::updateDetail(const QModelIndex& current) {
+    if (detailView_ == nullptr) {
+        return;
+    }
+    if (!current.isValid()) {
+        detailView_->clear();
+        return;
+    }
+
+    const QModelIndex source = layerProxy_->mapToSource(current);
+    if (!source.isValid()) {
+        detailView_->clear();
+        return;
+    }
+
+    const auto text = [this, &source](int column) {
+        return layerModel_
+            ->data(layerModel_->index(source.row(), column),
+                   Qt::DisplayRole)
+            .toString();
+    };
+
+    detailView_->setPlainText(
+        QStringLiteral("层：%1\nKey：%2\n值：%3")
+            .arg(text(0), text(1), text(2)));
 }

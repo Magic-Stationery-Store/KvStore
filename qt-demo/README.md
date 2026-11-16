@@ -6,13 +6,18 @@
 
 ## 界面说明
 
-- **层次数据**：按 `Active → Immutable → L0（新→旧）→ BASE` 顺序展示所有条目；
-  墓碑标红，空值显示为 `⟨空字符串⟩`。
+- **概览**：自绘层级分布图，展示 L0/L1/L2/L3/BASE 的表数、记录数、字节数，
+  以及 Block Cache 的命中率、hit/miss/evict 和驻留块数。
+- **层次数据**：按 `Active → Immutable → L0（新→旧）→ L1 → L2 → L3 → BASE`
+  顺序展示所有条目；墓碑标红，空值显示为 `⟨空字符串⟩`。
+  支持 `Ctrl+F` 过滤（层 / key / value 任意列）、表头排序、选中行详情。
 - **查询路径**：对输入的 key 逐层探测，显示每层是“命中 / 墓碑 / 未命中”，
   并给出最终结果。被遮蔽的旧值也会显示，方便理解 tombstone 的终止语义。
-- **文件**：WAL、`.imm`、`.sst`、`.base.*.log`、MANIFEST 及大小。
+- **文件**：WAL、`.imm`、L0/L1/L2/L3 `.sst`、`.base.*.log`、MANIFEST 及大小。
 - **MANIFEST**：清单原文。
-- **写入 / 操作**：Put、Delete、Sync、Flush、Compact，全部在 worker 线程执行。
+- **写入 / 操作**：Put、Delete、Sync、Flush、Compact，以及
+  `L0→L1 / L1→L2 / L2→L3` 分层压缩，全部在 worker 线程执行。
+- **窗口状态**：几何、splitter、过滤词通过 `QSettings` 持久化。
 
 ## 线程模型
 
@@ -61,11 +66,11 @@ cmake --build build-qt
 首次打开会在可执行文件旁的 `demo-data/demo.log` 生成一个演示库：
 
 - BASE：`a=base-a`、`b=base-b`、`c=base-c`
-- L0：`a=new`、`b=墓碑`、`d=four`
+- L1/L2/L3/L0：多层数据，`b` 的墓碑最终落在 L3
 - Active：`e=five`
 
-在“查询路径”输入 `b`，可以看到 L0 的墓碑终止查询，而 BASE 里仍有 `b=base-b`；
-输入 `a` 可以看到 L0 的 `new` 遮蔽 BASE 的 `base-a`。
+在“查询路径”输入 `b`，可以看到 L3 的墓碑终止查询，而 BASE 里仍有
+`b=base-b`；点击“分层压缩”菜单可以继续做 L0→L1/L1→L2/L2→L3。
 
 ## 无头截图
 

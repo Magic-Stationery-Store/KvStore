@@ -25,6 +25,9 @@ public slots:
     void syncNow();
     void flushNow();
     void compactNow();
+    void compactLevels();
+    void compactL1ToL2();
+    void compactL2ToL3();
 
 signals:
     void snapshotReady(const DemoSnapshot& snapshot);
