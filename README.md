@@ -30,6 +30,8 @@ MemTable、后台 Flush、多 L0 SSTable、MANIFEST 版本提交和全量 Compac
   无快照时每个 key 只保留最新版本。
 - **WriteBatch**：多条 Put/Delete 合并成一条 WAL Batch 记录，共享一个 commit
   sequence 原子提交；恢复时整条记录重放，截断则整批回滚。
+- **块式 SSTable + Bloom + Block Cache**：L0 按约 4 KiB 分块，打开时建立块索引和
+  user-key Bloom Filter；读路径先 Bloom 过滤，再按块加载，LRU Block Cache 默认 8 MiB。
 - **快照迭代器**：`new_iterator()` 跨 Active / Immutable / L0 / BASE 做多路归并，
   提供 `Seek/Next` 并跳过墓碑；物化一份有序快照，适合小数据量和调试。
 - **流式 MergingIterator**：`new_streaming_iterator()` 每层一个游标，按内部键归并，
@@ -98,10 +100,10 @@ cmake --build build-ubuntu -j2
 ctest --test-dir build-ubuntu --output-on-failure
 ```
 
-当前 19 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
+当前 20 项测试全部通过，覆盖模型对拍、WAL 截断修复、L0 遮蔽顺序、后台 Flush、
 并发与进程锁、MANIFEST 的六类中断点恢复、SIGKILL 循环恢复、MVCC 快照、
-WriteBatch 原子提交、快照感知 GC、流式迭代器与范围扫描，以及可视化控制台
-使用的只读观测接口。
+WriteBatch 原子提交、快照感知 GC、流式迭代器与范围扫描、块式 SSTable/Bloom/
+Block Cache，以及可视化控制台使用的只读观测接口。
 
 ```bash
 # 单测示例
@@ -127,7 +129,7 @@ cmake --build build-asan -j2
 ctest --test-dir build-asan --output-on-failure
 ```
 
-实测 ASan/UBSan 下 19/19 通过；`-DKVSTORE_SANITIZER=thread` 构建下 18 项通过
+实测 ASan/UBSan 下 20/20 通过；`-DKVSTORE_SANITIZER=thread` 构建下 19 项通过
 （不含依赖 fork 的 crash test），无数据竞争报告。
 
 Windows 下引擎与 CLI 也可以构建（POSIX 调用由 `src/platform.cpp` 的 Win32
@@ -161,39 +163,42 @@ TMPDIR=/home/you/kvstore-bench ./build-bench/kvstore_bench
 
 | 指标 | 数值 |
 | --- | --- |
-| Put 吞吐（不含 fsync） | 32.1 万 ops/s |
-| 一次 sync | 10.0 ms |
-| Get（MemTable） | 170 万 ops/s，P50 0.4 us / P99 1.0 us |
-| Get（L0） | 36.1 万 ops/s，P50 2.3 us / P99 7.3 us |
-| Flush | 123.5 ms |
-| Compact | 150.2 ms |
-| Get（BASE） | 36.9 万 ops/s，P50 2.3 us / P99 4.9 us |
+| Put 吞吐（不含 fsync） | 23.8 万 ops/s |
+| 一次 sync | 8.6 ms |
+| Get（MemTable） | 116 万 ops/s，P50 0.6 us / P99 1.4 us |
+| Get（L0，预热后） | 63.5 万 ops/s，P50 1.3 us / P99 2.8 us |
+| Flush | 173.7 ms |
+| Compact | 197.0 ms |
+| Get（BASE） | 26.5 万 ops/s，P50 3.3 us / P99 7.7 us |
+| Block Cache 命中 / 未命中 / 驱逐 | 58333 / 1667 / 0 |
 
 value 大小对吞吐的影响：
 
 | value | 记录数 | Put ops/s | Get ops/s | Get P99 |
 | --- | --- | --- | --- | --- |
-| 64 B | 20000 | 34.8 万 | 206 万 | 0.9 us |
-| 1 KiB | 20000 | 13.1 万 | 146 万 | 1.3 us |
-| 4 KiB | 10000 | 4.26 万 | 121 万 | 1.3 us |
+| 64 B | 20000 | 26.7 万 | 138 万 | 1.2 us |
+| 1 KiB | 20000 | 9.46 万 | 100 万 | 1.7 us |
+| 4 KiB | 10000 | 3.11 万 | 86.4 万 | 1.9 us |
 
 L0 读放大（`missing` 需要扫完所有 L0；`victim` 命中最早的表）：
 
 | L0 表数 | missing P50 | victim P50 |
 | --- | --- | --- |
-| 1 | 1.42 us | 1.40 us |
-| 10 | 3.52 us | 1.76 us |
-| 25 | 2.17 us | 2.05 us |
-| 50 | 12.46 us | 2.92 us |
+| 1 | 0.08 us | 0.32 us |
+| 10 | 0.19 us | 0.35 us |
+| 25 | 0.26 us | 0.45 us |
+| 50 | 0.40 us | 0.62 us |
 
 说明：
 
 - Put 只写 WAL 到页缓存，不含 `fsync`；`sync` 是 5 万条写后的一次 fsync。
 - 每个 key 额外带 11 B 的 MVCC 内部后缀，所以 BASE 约 6738 KiB；5 万个 key 都是唯一的，
   没有旧版本可回收，因此 Compact 前后大小不变；覆盖/删除场景由 `kvstore_compaction_tests` 覆盖。
-- L0 表数到 50 时 `missing` P50 从 1.42 us 升到 12.46 us，体现读放大；`victim` 命中
-  最早的表，稳定在 1.4–2.9 us。
-- Put/Get 已包含内部键编码和快照版本选择；数字是本机实测，换机器会变。
+- L0 表数到 50 时 `missing` P50 仍只有 0.40 us：Bloom 先过滤不存在的 user key，
+  Block Cache 复用已解析的数据块；优化前同一基准为 12.46 us（约 31 倍）。
+- L0 Get 是预热后的稳态；首次访问会有冷缓存 miss，P99 会更高。
+- Put/Get 已包含内部键编码、Bloom 过滤、块加载与快照版本选择；数字是本机实测，
+  换机器会变。
 
 ## Qt 可视化控制台
 
@@ -229,7 +234,8 @@ cmake --build build-qt
 
 | 决策 | 原因 | 代价 |
 | --- | --- | --- |
-| 每 key 全量内存索引 | 实现简单，查询 O(log N) | 大库内存占用高，尚无块索引/Bloom |
+| 每 key 全量内存索引 + 块索引 | 块读取/Bloom 降低读放大，实现比 B+ 树简单 | 大库索引仍占内存 |
+| LRU Block Cache（8 MiB） | 热点块复用，避免重复解析 | 额外内存；冷启动有 miss |
 | 全量文本 MANIFEST | 一次替换提交整个版本，易校验 | 每次 Flush 重写整份清单 |
 | 单后台线程 + 单 Immutable 槽位 | 天然背压，状态简单 | 前台写入可能被阻塞 |
 | Compact 持锁 | 实现简单、版本一致 | 压缩期间阻塞读写 |
@@ -242,7 +248,7 @@ kv_store.h / src/       引擎实现（WAL、MemTable、SSTable、MANIFEST、平
 app/main.cpp            命令行程序
 bench/                  单线程性能基准
 qt-demo/                Qt Widgets 可视化控制台
-tests/                  19 个端到端测试
+tests/                  20 个端到端测试
 learning/               学习期练习代码
 docs/                   截图与文档
 ```
@@ -254,7 +260,8 @@ docs/                   截图与文档
 - [x] ASan/UBSan/TSan 验证
 - [ ] 磁盘满 / EIO 故障注入
 - [ ] L0 → L1 分层压缩，部分压缩时保留墓碑
-- [ ] SSTable 块索引 + Bloom Filter
+- [x] SSTable 块索引 + Bloom Filter
+- [x] LRU Block Cache（默认 8 MiB）
 - [x] 快照迭代器（Seek/Next，跳过墓碑）
 - [x] MVCC 快照读（get / iterator）
 - [x] WriteBatch 原子提交

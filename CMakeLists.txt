@@ -256,6 +256,11 @@ if(BUILD_TESTING AND UNIX)
         COMMAND kvstore_streaming_iterator_tests
     )
 
+    add_executable(kvstore_block_cache_tests tests/block_cache_test.cpp)
+    target_link_libraries(kvstore_block_cache_tests PRIVATE kvstore)
+    enable_project_warnings(kvstore_block_cache_tests)
+    add_test(NAME kvstore_block_cache_tests COMMAND kvstore_block_cache_tests)
+
     set_tests_properties(kvstore_background_flush_tests kvstore_manifest_tests
         PROPERTIES TIMEOUT 60)
     set_tests_properties(kvstore_crash_recovery_tests

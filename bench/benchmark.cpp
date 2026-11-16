@@ -197,6 +197,13 @@ void run_main_benchmark(const Config& config) {
         const auto flush_started = Clock::now();
         store.flush();
         const auto flush_finished = Clock::now();
+
+        // Warm the block cache so the reported P99 reflects steady state.
+        (void)measure_random_gets(
+            store,
+            config.put_count,
+            std::min<std::size_t>(config.get_count, 10000),
+            112233);
         const GetStats l0_get = measure_random_gets(
             store, config.put_count, config.get_count, 23456);
 
@@ -235,6 +242,13 @@ void run_main_benchmark(const Config& config) {
                   << std::setprecision(1) << base_get.p50_us
                   << " / " << base_get.p99_us
                   << " us |\n";
+
+        const BlockCache::Stats cache = store.block_cache_stats();
+        std::cout << "| Block Cache 命中 / 未命中 / 驱逐 | "
+                  << cache.hits << " / " << cache.misses
+                  << " / " << cache.evictions << " |\n";
+        std::cout << "| Block Cache 驻留块 / 字节 | "
+                  << cache.entries << " / " << cache.bytes << " |\n";
     }
 
     cleanup_database(database);

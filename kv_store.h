@@ -206,6 +206,8 @@ class KVStore{
 
     void write(const WriteBatch& batch);
 
+    BlockCache::Stats block_cache_stats() const;
+
     private:
     class ProcessLock;
     struct SnapshotRegistry;
@@ -278,6 +280,8 @@ class KVStore{
         std::istream& input,
         const IndexEntry& entry
     ) const;
+
+    std::shared_ptr<BlockCache> block_cache_;
 
     std::unordered_map<std::string, std::string>
         memory_data_;

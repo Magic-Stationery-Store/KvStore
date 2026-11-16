@@ -1,4 +1,5 @@
 #include"kv_store.h"
+#include "internal_key.h"
 #include "log_record.h"
 #include "platform.h"
 #include <algorithm>
@@ -15,106 +16,9 @@
 
 namespace {
 
-constexpr std::size_t kInternalSuffixSize = 11;
-constexpr char kEscapedNul = static_cast<char>(0xFF);
-
-std::string escape_user_key(const std::string& user_key) {
-    std::string escaped;
-    escaped.reserve(user_key.size());
-    for (const char character : user_key) {
-        if (character == '\0') {
-            escaped.push_back('\0');
-            escaped.push_back(kEscapedNul);
-        } else {
-            escaped.push_back(character);
-        }
-    }
-    return escaped;
-}
-
-bool unescape_user_key(
-    const std::string& escaped,
-    std::string& user_key
-) {
-    user_key.clear();
-    user_key.reserve(escaped.size());
-    for (std::size_t i = 0; i < escaped.size(); ++i) {
-        if (escaped[i] == '\0') {
-            if (i + 1 >= escaped.size()
-                || escaped[i + 1] != kEscapedNul) {
-                return false;
-            }
-            user_key.push_back('\0');
-            ++i;
-        } else {
-            user_key.push_back(escaped[i]);
-        }
-    }
-    return true;
-}
-
-std::string encode_internal_key(
-    const std::string& user_key,
-    std::uint64_t sequence,
-    bool tombstone
-) {
-    std::string internal = escape_user_key(user_key);
-    internal.reserve(internal.size() + kInternalSuffixSize);
-    internal.push_back('\0');
-    internal.push_back('\0');
-
-    const std::uint64_t inverted = ~sequence;
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        internal.push_back(static_cast<char>(
-            (inverted >> shift) & 0xFFu));
-    }
-    internal.push_back(tombstone ? '\1' : '\0');
-    return internal;
-}
-
-bool decode_internal_key(
-    const std::string& internal,
-    std::string& user_key,
-    std::uint64_t& sequence,
-    bool& tombstone
-) {
-    if (internal.size() < kInternalSuffixSize) {
-        return false;
-    }
-    const std::size_t offset = internal.size() - kInternalSuffixSize;
-    if (internal[offset] != '\0' || internal[offset + 1] != '\0') {
-        return false;
-    }
-
-    std::uint64_t inverted = 0;
-    for (std::size_t i = 0; i < 8; ++i) {
-        inverted = (inverted << 8)
-            | static_cast<unsigned char>(internal[offset + 2 + i]);
-    }
-    sequence = ~inverted;
-    tombstone = internal.back() != '\0';
-    return unescape_user_key(
-        internal.substr(0, offset), user_key);
-}
-
-std::string encode_seek_key(
-    const std::string& user_key,
-    std::uint64_t sequence
-) {
-    std::string seek = escape_user_key(user_key);
-    seek.reserve(seek.size() + kInternalSuffixSize);
-    seek.push_back('\0');
-    seek.push_back('\0');
-
-    const std::uint64_t inverted = ~sequence;
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        seek.push_back(static_cast<char>(
-            (inverted >> shift) & 0xFFu));
-    }
-    seek.push_back('\0');
-    return seek;
-}
-
+using kvstore_internal::decode_internal_key;
+using kvstore_internal::encode_internal_key;
+using kvstore_internal::encode_seek_key;
 void append_u32(std::string& output, std::uint32_t value) {
     for (int shift = 0; shift < 32; shift += 8) {
         output.push_back(static_cast<char>(
@@ -383,6 +287,7 @@ struct KVStore::Snapshot::State {
 
 KVStore::KVStore() {
     snapshot_registry_ = std::make_shared<SnapshotRegistry>();
+    block_cache_ = std::make_shared<BlockCache>();
 }
 
 KVStore::~KVStore() {
@@ -404,6 +309,7 @@ KVStore::KVStore(
     : memtable_entry_limit_(memtable_entry_limit),
       log_path_(log_path) {
     snapshot_registry_ = std::make_shared<SnapshotRegistry>();
+    block_cache_ = std::make_shared<BlockCache>();
     if (log_path_.empty()) {
         throw std::invalid_argument(
             "Log path cannot be empty");
@@ -540,6 +446,9 @@ KVStore::LookupResult KVStore::lookup_locked(
     for (auto table = level0_tables_.rbegin();
          table != level0_tables_.rend();
          ++table) {
+        if (!table->table->might_contain_user(key)) {
+            continue;
+        }
         const SSTableSeekResult result = table->table->seek(seek);
         if (!result.found) {
             continue;
@@ -882,7 +791,7 @@ void KVStore::initialize_manifest() {
         replay();
         for (const auto generation : manifest_.level0) {
             const std::string path = sstable_path_for_generation(generation);
-            auto table = std::make_shared<SSTable>(path);
+            auto table = std::make_shared<SSTable>(path, block_cache_);
             for (const auto& [key, value] : table->read_all()) {
                 (void)value;
                 observe_internal_key(key);
@@ -998,7 +907,7 @@ void KVStore::load_sstables() {
 
     std::sort(files.begin(), files.end());
     for (const auto& [generation, path] : files) {
-        auto table = std::make_shared<SSTable>(path);
+        auto table = std::make_shared<SSTable>(path, block_cache_);
         for (const auto& [key, value] : table->read_all()) {
             (void)value;
             observe_internal_key(key);
@@ -1115,7 +1024,7 @@ void KVStore::recover_immutable_wals() {
             // from the immutable WAL, even if its bytes look valid.
             std::filesystem::remove(table_path);
             SSTable::build(table_path, recovered);
-            auto table = std::make_shared<SSTable>(table_path);
+            auto table = std::make_shared<SSTable>(table_path, block_cache_);
             auto state = manifest_;
             state.level0.push_back(generation);
             std::sort(state.level0.begin(), state.level0.end());
@@ -1263,7 +1172,7 @@ void KVStore::background_flush_loop() {
             const std::string table_path =
                 sstable_path_for_generation(generation);
             SSTable::build(table_path, *snapshot);
-            auto table = std::make_shared<SSTable>(table_path);
+            auto table = std::make_shared<SSTable>(table_path, block_cache_);
 
             {
                 const std::lock_guard<std::mutex> guard(mutex_);
@@ -1782,6 +1691,13 @@ std::vector<KVStore::TableInfo> KVStore::inspect_tables() const {
 ManifestState KVStore::manifest_snapshot() const {
     const std::lock_guard<std::mutex> guard(mutex_);
     return manifest_;
+}
+
+BlockCache::Stats KVStore::block_cache_stats() const {
+    if (!block_cache_) {
+        return BlockCache::Stats{};
+    }
+    return block_cache_->stats();
 }
 
 std::size_t KVStore::memtable_entry_count() const {
