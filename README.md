@@ -19,8 +19,8 @@ L0→L1→L2→L3 部分分层压缩。配套一个 Qt Widgets 可视化控制�
   Immutable WAL；前台通过条件变量等待发布完成（Flush 屏障）。
 - **版本提交**：MANIFEST 是完整文本快照，带 CRC32；`tmp → fsync → rename →
   目录 fsync` 一次原子替换即切换版本。
-- **全量 Compact**：合并 BASE、所有 L0 和 Active 数据，生成新 BASE 并一次性
-  退役全部 L0；旧文件残留不会让删除的 key 复活。
+- **全量 Compact**：合并 BASE、所有 L0–L3 和 Active 数据，生成新 BASE 并一次性
+  退役全部层级表；旧文件残留不会让删除的 key 复活。
 - **并发安全**：单互斥锁保护全部状态，后台线程只处理冻结快照；进程锁防止
   同一个数据库被多个进程打开。
 - **可观测性**：`inspect_entries` / `explain_key` / `inspect_tables` 只读接口，
