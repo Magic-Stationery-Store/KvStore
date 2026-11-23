@@ -39,6 +39,9 @@ Compact 这类阻塞调用。
 .\scripts\run-qt-demo.ps1 -Demo
 ```
 
+也可以直接双击仓库根目录的 `run-qt-demo.cmd`：它会设置 Qt DLL / 插件路径并
+以 `--demo` 启动，适合面试前快速打开。
+
 没有这套工具链时，用 Qt 官方安装器装 Qt 6.8 LTS（MSVC 或 MinGW），然后：
 
 ```powershell
